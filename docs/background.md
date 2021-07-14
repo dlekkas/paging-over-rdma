@@ -136,6 +136,10 @@ struct request {
 
 
 ### Block layer or I/O Linux subsystem
+
+#### Architecture
+![alt text](pics/block-layer-arch.png)
+
 [TODO: get a better understanding of I/O subsystem in Linux]
 Applications submit I/Os via a kernel system call, that converts them into a
 data structure called a block I/O. Each block I/O contains information such as
