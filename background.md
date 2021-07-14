@@ -14,6 +14,11 @@ using blocks. Since the smallest unit of physical addressing is the sector, the
 size of the block must be a multiple of the size of the sector. Additionally,
 the block size must not exceed the size of a page.
 
+### What is a virtual block device?
+A virtual block device is a block device that is exposed by the Linux kernel
+when an operation is performed. Almost all the operations on a physical block
+device can be performed on a virtual block device.
+
 ### How is block I/O represented in the kernel?
 The basic container for block I/O within the kernel is the `bio` structure,
 which is defined in `<linux/blk_types.h>`. This structure represents block I/O
@@ -168,7 +173,6 @@ for redundant tagging. While  the  MQ  implementation  could  maintain  a
 traditional in-flight list for legacy drivers, high IOPS drivers will likely
 need to make use of tagged IO to scale well.
 
-
 The VMM issues BIOs (block I/Os) to the block layer of the kernel. BIOs is the
 main unit of I/O for the block layer and lower layers (i.e. drivers and
 stacking drivers). Those BIOs are defined in file `include/linux/blk_types.h`
@@ -181,7 +185,6 @@ struct block_device {
 	struct request_queue *bd_queue;
 	...
 }
-
 ```
 
 
@@ -198,9 +201,7 @@ I/O scheduling that improve performance and protect end-users from malicious
 device drivers.
 
 
-"We also rely on stackbd to redirect page I/O requests to the disk to handle
-possible remote failures and evictions."
-
+### What is stackbd?
 stackbd is a virtual block device that acts as the front-end of another block
 device in the Linux kernel and is used to create logical volumes or, in other
 words modify I/O requests' address values and target devices. stackbd's current
@@ -223,5 +224,47 @@ the device mapper itself, to another block device. Data can also be modified in
 transition, which is performed, for example, in the case of device mapper
 providing disk encryption. [Ref: Wikipedia]
 
-Why was stackbd used? To provide a way to open/read/write a block device from a
-kernel module. The answer to this question is the device mapper
+### `blk_mq` API
+`struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *)`: initializes
+a multi queue based on a tag set (defined in `<linux/blk-mq.h>`). But what is a
+tag set? Let's look into how tag set is defined in `<linux/blk-mq.h>`:
+```
+struct blk_mq_tag_set {
+	struct blk_mq_ops *ops;
+	unsigned int nr_hw_queues;
+	unsigned int queue_depth;
+	unsigned int reserved_tags;
+	unsigned int cmd_size;
+	int numa_node;
+	unsigned int timeout;
+	unsigned int flags;
+	void *driver_data;
+
+	struct blk_mq_tags **tags;
+
+	struct mutex tag_list_lock;
+	struct list_head tag_list;
+};
+
+struct blk_mq_ops {
+	// queue request
+	queue_rq_fn *queue_rq;
+	// map request to specific hardware queue
+	map_queue_fn *map_queue;
+	// called on request timeout
+	timeout_fn *timeout;
+	// called to poll for completion of a specific tag
+	poll_fn *poll;
+
+	softirq_done_fn *complete;
+
+	/* called when the block layer side of hardware queue has been
+	 * setup, allowing the driver to allocate/init matching structures.
+	 * Ditto for exit/teardown */
+	init_hctx_fn *init_hctx;
+	exit_hctx_fn *exit_hctx;
+
+}
+```
+
+

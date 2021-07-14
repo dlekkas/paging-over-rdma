@@ -5,6 +5,12 @@ Our primary interest is not on the page replacement policy but rather on what
 happens when a page needs to be replaced. We also want to focus on the
 interaction between the swap device and the page replacement daemon.
 
+Swap space is divided into blocks the same size as memory pages (usually 4kB),
+and a record of the mapping of these pages to application memory forms an
+extension of the virtual memory subsystem in the CPU and OS. When memory is
+swapped to disk, a kernel component is responsible to maintain the mapping of
+an application's memory space to the block on disk.
+
 ## Swap kernel impl
 During system startup, the module *kswapd* is loaded and calls its init
 function called `kswapd_init()` which subsequently invokes `kswapd_run()` which
@@ -65,6 +71,8 @@ its operations in `fs/ext4/inode.c` and the `writepage` field of its
 `address_space_operations` points to `ext4_writepage()`. Afterwards, the
 function `ext4_io_submit()` is invoked which invokes `submit_bio` which submits
 a BIO to the block device layer for I/O by adding it to the request queue.
+
+
 
 # Does swap device have a file system?
 Swap is an option when formatting a drive, but isn't an actual file system. It's
