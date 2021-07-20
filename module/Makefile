@@ -1,8 +1,8 @@
-EXTRA_CFLAGS += -D_GNU_SOURCE 
+EXTRA_CFLAGS += -D_GNU_SOURCE
 obj-m := stackbd.o
 
 all:
-	make -C /usr/src/linux-headers-$(shell uname -r) M=$(shell pwd) modules
+	make CC=gcc-4.8 -C /usr/src/linux-headers-$(shell uname -r) M=$(shell pwd) modules
 
 clean:
-	make -C /usr/src/linux-headers-$(shell uname -r) M=$(shell pwd) clean
+	make CC=gcc-4.8 -C /usr/src/linux-headers-$(shell uname -r) M=$(shell pwd) clean

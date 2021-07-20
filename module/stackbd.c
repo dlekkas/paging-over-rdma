@@ -14,7 +14,10 @@
 
 #include <trace/events/block.h>
 
-#include "../common/stackbd.h"
+#include "stackbd.h"
+
+
+#define BDISK "/dev/nvme0n1p3"
 
 #define STACKBD_BDEV_MODE (FMODE_READ | FMODE_WRITE | FMODE_EXCL)
 #define DEBUGGG printk("stackbd: %d\n", __LINE__);
@@ -39,7 +42,7 @@ static struct stackbd_t {
     sector_t capacity; /* Sectors */
     struct gendisk *gd;
     spinlock_t lock;
-    struct bio_list bio_list;    
+    struct bio_list bio_list;
     struct task_struct *thread;
     int is_active;
     struct block_device *bdev_raw;
@@ -59,11 +62,10 @@ static void stackbd_io_fn(struct bio *bio)
 //
 //    if (lba != EMPTY_REAL_LBA)
 //        bio->bi_sector = lba;
-    // bio->bi_bdev = stackbd.bdev_raw;
+    bio->bi_bdev = stackbd.bdev_raw;
 
     trace_block_bio_remap(bdev_get_queue(stackbd.bdev_raw), bio,
-            //bio->bi_bdev->bd_dev, bio->bi_iter.bi_sector);
-            stackbd.bdev_raw->bd_dev, bio->bi_iter.bi_sector);
+            bio->bi_bdev->bd_dev, bio->bi_iter.bi_sector);
 
     /* No need to call bio_endio() */
     generic_make_request(bio);
@@ -77,7 +79,7 @@ static int stackbd_threadfn(void *data)
 
     while (!kthread_should_stop())
     {
-        /* wake_up() is after adding bio to list. No need for condition */ 
+        /* wake_up() is after adding bio to list. No need for condition */
         wait_event_interruptible(req_event, kthread_should_stop() ||
                 !bio_list_empty(&stackbd.bio_list));
 
@@ -102,7 +104,7 @@ static int stackbd_threadfn(void *data)
  */
 static blk_qc_t stackbd_make_request(struct request_queue *q, struct bio *bio)
 {
-    printk("stackbd: make request %-5s block %-12llu #pages %-4hu total-size "
+    printk("stackbd: make request %-5s block %-12lu #pages %-4hu total-size "
             "%-10u\n", bio_data_dir(bio) == WRITE ? "write" : "read",
             bio->bi_iter.bi_sector, bio->bi_vcnt, bio->bi_iter.bi_size);
 
@@ -132,13 +134,13 @@ abort:
     spin_unlock_irq(&stackbd.lock);
     printk("<%p> Abort request\n\n", bio);
     bio_io_error(bio);
-    return 0;
+		return 0;
 }
 
 static struct block_device *stackbd_bdev_open(char dev_path[])
 {
     /* Open underlying device */
-    struct block_device *bdev_raw = lookup_bdev(dev_path);
+    struct block_device *bdev_raw = lookup_bdev(dev_path, 0);
     printk("Opened %s\n", dev_path);
 
     if (IS_ERR(bdev_raw))
@@ -172,7 +174,7 @@ static int stackbd_start(char dev_path[])
 
     /* Set up our internal device */
     stackbd.capacity = get_capacity(stackbd.bdev_raw->bd_disk);
-    printk("stackbd: Device real capacity: %llu\n", stackbd.capacity);
+    printk("stackbd: Device real capacity: %lu\n", stackbd.capacity);
 
     set_capacity(stackbd.gd, stackbd.capacity);
 
@@ -206,15 +208,18 @@ static int stackbd_ioctl(struct block_device *bdev, fmode_t mode,
 		     unsigned int cmd, unsigned long arg)
 {
     char dev_path[80];
-	void __user *argp = (void __user *)arg;    
+	void __user *argp = (void __user *)arg;
 
     switch (cmd)
     {
     case STACKBD_DO_IT:
         printk("\n*** DO IT!!!!!!! ***\n\n");
 
-        if (copy_from_user(dev_path, argp, sizeof(dev_path)))
+				if (copy_from_user(dev_path, argp, sizeof(dev_path))) {
+						printk("copy_from_user() failed.");
             return -EFAULT;
+
+				}
 
         return stackbd_start(dev_path);
     default:
@@ -284,7 +289,12 @@ static int __init stackbd_init(void)
 	stackbd.gd->queue = stackbd.queue;
 	add_disk(stackbd.gd);
 
-    printk("stackbd: init done\n");
+  printk("stackbd: init done\n");
+	if (stackbd_start(BDISK) < 0) {
+		printk("stackbd_start() failed");
+		printk("Kernel call returned: %m");
+		return -1;
+	}
 
 	return 0;
 
