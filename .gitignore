@@ -1,0 +1,16 @@
+# kernel object files
+.*
+*.o
+*.o.*
+*.ko
+*.ko.*
+*.a
+*.so
+*.out
+
+*.order
+Module.symvers
+*.mod.c
+
+# git file that we don't want to ignore
+!.gitignore
