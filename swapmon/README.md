@@ -3,17 +3,19 @@ First, we want to load the stackbd module which is stacked upon the device
 `/dev/nvme0n1p3` and monitors and prints the requests in the kernel logs that
 this device receives. To achieve that, we first have to disable swapping
 because we have to open this device exclusively during the module initialization
-phase. This is achieved by the following command: \\
-`swapoff /dev/nvmen1p3`
+phase. This is achieved by the following command:
+```
+swapoff /dev/nvmen1p3
+```
 
-Afterwards, we compile and insert the `stackbd` module: \\
+Afterwards, we compile and insert the `stackbd` module:
 ```
 cd swapmon
 make
 sudo insmod ./stackbd.ko
 ```
 
-We now prepare our virtual block device for swapping: \\
+We now prepare our virtual block device for swapping:
 ```
 sudo mkswap /dev/stackbd0
 sudo swapon /dev/stackbd0
