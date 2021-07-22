@@ -5,7 +5,7 @@
 #include <vector>
 
 int main(void) {
-	constexpr int sz = 100 * 1024 * 1024;
+	constexpr int sz = 100 * 1024 * 1024; // 400 MB
 	std::vector<int> vec(sz);
 
 	srand(time(nullptr));
