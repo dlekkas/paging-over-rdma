@@ -149,6 +149,18 @@ static void swapmon_rdma_qp_event(struct ib_event *event, void *context) {
 	pr_debug("QP event %s (%d)\n", ib_event_msg(event->event), event->event);
 }
 
+// In order to perform RDMA operations, establishment of a connection to
+// the remote host as well as appropriate permissions need to be set up first.
+// The mechanism for accomplishing this is the Queue Pair (QP) which is roughly
+// equivalent to a socket. The QP needs to be initialized on both sides of the
+// connection. Once a QP is established, the verbs API can be used to perform
+// RDMA reads/writes and atomic ops. Transport layer communication is done
+// between a QP in each communicating HCA port.
+//
+// Each QP is made up of a Send Queue (SQ) (used for sending outgoing messages),
+// a Receive Queue (RQ) (used for receiving incoming messages), and their
+// associated Completion Queues (CQs). A "queue" is analogous to a FIFO waiting
+// line where items must leave the queue in the same order that they enter it.
 static int swapmon_rdma_create_qp(const int factor) {
 	struct ib_qp_init_attr init_attr;
 	int ret;
@@ -178,12 +190,13 @@ static int swapmon_rdma_create_qp(const int factor) {
 }
 
 
-static int swapmon_rdma_addr_resolved() {
+static int swapmon_rdma_addr_resolved(void) {
 	const int send_wr_factor = 3;
 	const int cq_factor = send_wr_factor + 1;
 	int comp_vector = 0;
 	int ret;
 
+	// struct ib_device represents a handle to the HCA
 	ctrl->dev = ctrl->cm_id->device;
 	if (!ctrl->dev) {
 		pr_err("No device found.\n");
@@ -191,8 +204,10 @@ static int swapmon_rdma_addr_resolved() {
 		goto out_err;
 	}
 
-	// allocate a protection domain which we can use to create objects within
+	// Allocate a protection domain which we can use to create objects within
 	// the domain. we can register and associate memory regions with this PD
+	// In addition to the CQs to be associated with the QP about to be created,
+	// the PD that the QP will belong to must also have been created.
 	ctrl->pd = ib_alloc_pd(ctrl->dev, 0);
 	if (IS_ERR(ctrl->pd)) {
 		pr_err("ib_alloc_pd failed.\n");
@@ -209,6 +224,11 @@ static int swapmon_rdma_addr_resolved() {
 	}
 
 
+	// Before creating the local QP, we must first cause the HCA to create the CQs
+	// to be associated with the SQ and RQ of the QP about to be created. The QP's
+	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
+	// specifies the number of Completion Queue Entries (CQEs) and represents the
+	// size of the CQ.
 	ctrl->cq = ib_alloc_cq(ctrl->dev, ctrl, cq_factor * 1024, comp_vector,
 			IB_POLL_SOFTIRQ);
 	if (IS_ERR(ctrl->cq)) {
@@ -244,23 +264,26 @@ out_err:
 	return ret;
 }
 
-static int swapmon_rdma_route_resolved() {
+static int swapmon_rdma_route_resolved(void) {
+	// specify the connection parameters
 	struct rdma_conn_param param = {};
   int ret;
 
-  param.qp_num = ctrl->qp->qp_num;
-  param.flow_control = 1;
-  param.responder_resources = 16;
-  param.initiator_depth = 16;
-  param.retry_count = 7;
-  param.rnr_retry_count = 7;
   param.private_data = NULL;
   param.private_data_len = 0;
+  param.responder_resources = 16;
+  param.initiator_depth = 16;
+  param.flow_control = 1;
+  param.retry_count = 7;
+  param.rnr_retry_count = 7;
+  param.qp_num = ctrl->qp->qp_num;
 
   pr_info("max_qp_rd_atom=%d max_qp_init_rd_atom=%d\n",
       ctrl->dev->attrs.max_qp_rd_atom,
       ctrl->dev->attrs.max_qp_init_rd_atom);
 
+	// Initiate an active connection request (i.e. send REQ message). The route
+	// must have been resolved before trying to connect.
   ret = rdma_connect(ctrl->cm_id, &param);
   if (ret) {
     pr_err("rdma_connect failed (%d)\n", ret);
@@ -270,6 +293,10 @@ static int swapmon_rdma_route_resolved() {
   return 0;
 }
 
+// For connection establishment, a sample sequence consists of a Request (REQ)
+// from the client to the server, a Reply (REP) from the server to the client
+// (to indicate that the request was accepted), and a Ready To Use (RTU) from
+// the client to the server.
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event) {
 	int cm_error = 0;
@@ -292,12 +319,21 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_ADDR_ERROR:
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 		case RDMA_CM_EVENT_CONNECT_RESPONSE:
+			pr_info("successful response to the connection request (REQ).\n");
+			break;
 		case RDMA_CM_EVENT_CONNECT_ERROR:
+			pr_err("error while trying to establish connection.\n");
+			break;
 		case RDMA_CM_EVENT_UNREACHABLE:
+			pr_info("remote server is unreachable or unable to respond to \
+					connection request.\n");
+			break;
 		case RDMA_CM_EVENT_REJECTED:
 		case RDMA_CM_EVENT_DISCONNECTED:
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
+			pr_info("multicast join operation completed successfully.\n");
+			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
 		case RDMA_CM_EVENT_ADDR_CHANGE:
 		case RDMA_CM_EVENT_TIMEWAIT_EXIT:
@@ -316,14 +352,14 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 }
 
 
-static int swapmon_rdma_wait_for_cm() {
+static int swapmon_rdma_wait_for_cm(void) {
 	wait_for_completion_interruptible_timeout(&ctrl->cm_done,
 			msecs_to_jiffies(SWAPMON_RDMA_CONNECTION_TIMEOUT_MS) + 1);
 	return ctrl->cm_error;
 }
 
 
-static int swapmon_rdma_create_ctrl() {
+static int swapmon_rdma_create_ctrl(void) {
 	int ret;
 	printk("swapmon: swapmon_rdma_create_ctrl()\n");
 
@@ -351,6 +387,11 @@ static int swapmon_rdma_create_ctrl() {
 		return -EINVAL;
 	}
 
+	// Each end of an RC service requires a Connection Manager (CM) to exchange
+	// Management Datagram (MAD) in order to create and associate QPs at the two
+	// ends. The `rdma_cm` identifier will report its event data (e.g. results of
+	// connecting) on the event channel and those events will be handled by the
+	// provided callback function `swapmon_rdma_cm_event_handler`.
 	ctrl->cm_id = rdma_create_id(&init_net, swapmon_rdma_cm_event_handler, ctrl,
 			RDMA_PS_TCP, ctrl->qp_type);
 	if (IS_ERR(ctrl->cm_id)) {
@@ -360,7 +401,7 @@ static int swapmon_rdma_create_ctrl() {
 
 	// Resolve destination and optionally source addresses from IP addresses to an
 	// RDMA address and if the resolution is successful, then the RDMA cm id will
-	// be bound to a local device.
+	// be bound to an RDMA device.
 	ret = rdma_resolve_addr(ctrl->cm_id, (struct sockaddr *)&ctrl->client_addr,
 			(struct sockaddr *)&ctrl->server_addr, SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
 	if (ret) {
@@ -381,7 +422,7 @@ out_destroy_cm_id:
 	return ret;
 }
 
-static int rdma_conn_init() {
+static int rdma_conn_init(void) {
 	int ret;
 
 	// register an IB client, in order to register callbacks for IB device
@@ -414,11 +455,7 @@ static int __init swapmonfs_init(void) {
 	}
 	printk("swapmon: module loaded\n");
 
-
-
-
 	return 0;
-
 }
 
 static void __exit swapmonfs_exit(void) {
@@ -427,3 +464,5 @@ static void __exit swapmonfs_exit(void) {
 
 module_init(swapmonfs_init);
 module_exit(swapmonfs_exit);
+
+MODULE_LICENSE("GPL v2");
