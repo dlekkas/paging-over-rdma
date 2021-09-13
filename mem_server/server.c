@@ -1,22 +1,33 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
 
 #include <arpa/inet.h>
 #include <rdma/rdma_cma.h>
+#include <rdma/rdma_verbs.h>
+#include <infiniband/verbs.h>
 
 int on_connect_request(struct rdma_cm_id *cm_id, struct rdma_conn_param *param) {
 	int ret;
 
-	struct ibv_pd *pd;
-	pd = ibv_alloc_pd(cm_id->verbs);
-	if (pd) {
-		printf("ibv_alloc_pd() failed.\n");
+	if (cm_id->verbs == NULL) {
+		printf("cm_id->verbs is NULL.\n");
 		return -1;
 	}
 
+	struct ibv_pd *pd;
+	pd = ibv_alloc_pd(cm_id->verbs);
+	if (pd == NULL) {
+		printf("ibv_alloc_pd() failed.\n");
+		return -1;
+	}
+	// buffer = malloc(256);
+	// mr = ibv_reg_mr(pd, buffer, 256, 0);
+
 	struct ibv_qp_init_attr attr;
 	memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
-	// attr.send_cq = ??
-	// attr.recv_cq = ??
+	//attr.send_cq = cq;
+	//attr.recv_cq = cq;
 	attr.cap.max_send_wr = 1;
 	attr.cap.max_recv_wr = 1;
 	attr.cap.max_send_sge = 1;
@@ -26,9 +37,10 @@ int on_connect_request(struct rdma_cm_id *cm_id, struct rdma_conn_param *param) 
 
 	ret = rdma_create_qp(cm_id, pd, &attr);
 	if (ret) {
-		printf("rdma_create_qp() failed with exit code %d.\n", ret);
+		fprintf(stderr, "rdma_create_qp() failed: %s.\n", strerror(errno));
 		return ret;
 	}
+	printf("rdma_create_qp() completed successfully.\n");
 
 	struct rdma_conn_param conn_param;
 	memset(&conn_param, 0, sizeof(conn_param));
@@ -44,17 +56,19 @@ int on_connect_request(struct rdma_cm_id *cm_id, struct rdma_conn_param *param) 
 		printf("rdma_accept() failed with exit code %d.\n", ret);
 		return ret;
 	}
+	printf("rdma_accept() completed successfully.\n");
 
 	return 0;
 }
 
 int cm_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event) {
+	printf("cm_event_handler()\n");
 	switch (event->event) {
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 			// Upon receiving a REQ message, we can allocate a QP and accept the
 			// incoming connection request.
-			on_connect_request(cm_id, &event->param.conn);
 			printf("Received a connection request.\n");
+			on_connect_request(event->id, &event->param.conn);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			// Upon receiving a message that connection is established, we can
@@ -63,6 +77,7 @@ int cm_event_handler(struct rdma_cm_id *cm_id, struct rdma_cm_event *event) {
 			printf("Connection is established successfully.\n");
 			break;
 	}
+	return 0;
 }
 
 
@@ -84,8 +99,8 @@ int main(void) {
 
 	struct sockaddr_in sa;
 	sa.sin_family = AF_INET;
-	sa.sin_port = 10000;
-	ret = inet_pton(AF_INET, "192.168.1.10", &(sa.sin_addr));
+	sa.sin_port = htons(10000);
+	ret = inet_pton(AF_INET, "192.168.1.20", &(sa.sin_addr));
 	if (ret <= 0) {
 		printf("invalid IP address.\n");
 		return ret;
@@ -108,14 +123,14 @@ int main(void) {
 		return ret;
 	}
 
-	printf("Listening in port %d\n", sa.sin_port);
+	printf("Listening in port %d\n", ntohs(rdma_get_src_port(server_cm_id)));
 
 	struct rdma_cm_event *event;
 	while (rdma_get_cm_event(ev_channel, &event) == 0) {
+		printf("Received an event.\n");
 		cm_event_handler(server_cm_id, event);
 		rdma_ack_cm_event(event);
 	}
-
 
 	rdma_destroy_event_channel(ev_channel);
 }
