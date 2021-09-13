@@ -28,12 +28,15 @@ struct swapmon_rdma_ctrl {
 	// completion queue (CQ)
 	struct ib_cq *cq;
 
+	spinlock_t cq_lock;
+
 	enum ib_qp_type qp_type;
 
 	// RDMA identifier created through `rdma_create_id`
 	struct rdma_cm_id *cm_id;
 
 	struct completion cm_done;
+	atomic_t pending;
 	int cm_error;
 
 	int queue_size;
@@ -124,6 +127,7 @@ static int server_port;
 
 module_param_named(sport, server_port, int, 0644);
 module_param_string(sip, server_ip, INET_ADDRSTRLEN, 0644);
+module_param_string(cip, client_ip, INET_ADDRSTRLEN, 0644);
 
 static int swapmon_rdma_parse_ipaddr(struct sockaddr_in *saddr, char *ip) {
 	int ret;
@@ -136,7 +140,7 @@ static int swapmon_rdma_parse_ipaddr(struct sockaddr_in *saddr, char *ip) {
     return -EINVAL;
 	}
 	ret = in4_pton(ip, buflen, addr, '\0', NULL);
-  if (ret) {
+  if (ret <= 0) {
 		printk("in4_pton() failed, unable to parse ip address: %s\n", ip);
     return -EINVAL;
 	}
@@ -329,6 +333,8 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 					connection request.\n");
 			break;
 		case RDMA_CM_EVENT_REJECTED:
+			pr_info("Connection request or response rejected by remote endpoint.\n");
+			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
@@ -386,6 +392,13 @@ static int swapmon_rdma_create_ctrl(void) {
 		printk("swapmon: swapmon_rdma_parse_ipaddr() for client ip failed\n");
 		return -EINVAL;
 	}
+	pr_info("src and dst addresses parsed successfully.\n");
+
+	init_completion(&ctrl->cm_done);
+	atomic_set(&ctrl->pending, 0);
+	spin_lock_init(&ctrl->cq_lock);
+
+	pr_info("init_completion, atomic_set and spin_lock_init successful.\n");
 
 	// Each end of an RC service requires a Connection Manager (CM) to exchange
 	// Management Datagram (MAD) in order to create and associate QPs at the two
@@ -399,6 +412,8 @@ static int swapmon_rdma_create_ctrl(void) {
 		return -ENODEV;
 	}
 
+	pr_info("rdma_create_id completed successfully.\n");
+
 	// Resolve destination and optionally source addresses from IP addresses to an
 	// RDMA address and if the resolution is successful, then the RDMA cm id will
 	// be bound to an RDMA device.
@@ -408,6 +423,10 @@ static int swapmon_rdma_create_ctrl(void) {
 		pr_err("rdma_resolve_addr failed: %d\n", ret);
 		goto out_destroy_cm_id;
 	}
+
+	pr_info("rdma_resolve_addr completed successfully.\n");
+	// TODO(dimlek): remove this ret statement when everything is ok.
+	return 0;
 
 	ret = swapmon_rdma_wait_for_cm();
 	if (ret) {
@@ -428,11 +447,14 @@ static int rdma_conn_init(void) {
 	// register an IB client, in order to register callbacks for IB device
 	// addition and removal. When an IB device is added, each registered
 	// client's add method will be called and similarly for removal.
+	/*
 	ret = ib_register_client(&swapmon_ib_client);
 	if (ret) {
 		printk("swapmon: ib_register_client() failed\n");
 		return ret;
 	}
+	printk("ib_register_client() completed successfully.\n");
+	*/
 
 	ret = swapmon_rdma_create_ctrl();
 	if (ret)
@@ -453,7 +475,7 @@ static int __init swapmonfs_init(void) {
 	if (!ret) {
 		printk("swapmon: rdma connection established successfully\n");
 	}
-	printk("swapmon: module loaded\n");
+	printk("swapmon: module loaded successfully.\n");
 
 	return 0;
 }
