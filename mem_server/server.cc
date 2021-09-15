@@ -10,13 +10,48 @@
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
 
+class ConnectionRDMA {
+ public:
+	struct rdma_cm_id* id;
+	struct ibv_qp* qp;
+	struct ibv_pd* pd;
+
+	ConnectionRDMA(struct rdma_cm_id *id, struct ibv_qp *qp, struct ibv_pd* pd)
+		: id(id), qp(qp), pd(pd) {}
+
+	~ConnectionRDMA() {
+		if (pd != nullptr) {
+			if (ibv_dealloc_pd(pd)) {
+				std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
+			}
+		}
+
+		if (qp != nullptr) {
+			if (ibv_destroy_qp(qp)) {
+				std::cerr << "ibv_destroy_qp failed: " << std::strerror(errno) << "\n";
+			}
+		}
+
+		if (id != nullptr) {
+			// Any associated QP must be freed before destroying the CM ID.
+			if (rdma_destroy_id(id)) {
+				std::cerr << "rdma_destroy_id failed: " << std::strerror(errno) << "\n";
+			}
+		}
+	}
+};
+
+
 class ServerRDMA {
 
  public:
-	ServerRDMA(const std::string& ip_addr, int port);
+	ServerRDMA() {}
+
 	~ServerRDMA();
 
 	void Listen(const std::string& ip_addr, int port);
+
+	int WaitForClients(int n_clients);
 
 
  private:
@@ -40,7 +75,7 @@ class ServerRDMA {
 	void *buf_;
 
 	// Vector of the RDMA CM ids of the connected clients.
-	std::vector<struct rdma_cm_id *> client_cm_ids_;
+	std::vector<ConnectionRDMA> clients_;
 
 	// Number of accepted connections.
 	int n_conns_;
@@ -96,6 +131,7 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_id *ev_cm_id,
 			// acknowledge the event back to the client. The call below also frees
 			// the event structure and any memory it references.
 			std::cout << "Connection is established successfully.\n";
+			clients_.push_back({ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd});
 			n_conns_++;
 			break;
 		case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -161,10 +197,40 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 
 	int listen_port = ntohs(rdma_get_src_port(cm_id_));
 	std::cout << "Listening in port " << std::to_string(listen_port) << "\n";
+
+	pd_ = ibv_alloc_pd(cm_id_->verbs);
+	if (pd_ == NULL) {
+		std::cerr << "ibv_alloc_pd() failed: " << std::strerror(errno) << "\n";
+	}
+}
+
+int ServerRDMA::WaitForClients(int n_clients) {
+	// Retrieve communication events until `n_clients` have successfully
+	// established their connection with our server.
+	struct rdma_cm_event *event;
+	while (n_conns_ < n_clients && rdma_get_cm_event(ev_channel_, &event)) {
+		cm_event_handler(cm_id_, event);
+		rdma_ack_cm_event(event);
+	}
+
+	if (n_conns_ < n_clients) {
+		std::cerr << "rmda_get_cm_event() failed: " << std::strerror(errno) << "\n";
+	}
+
+	return n_conns_;
 }
 
 
 ServerRDMA::~ServerRDMA() {
+	for (auto& client: clients_) {
+	}
+
+	if (pd_ != NULL) {
+		if (ibv_dealloc_pd(pd_)) {
+			std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
 	if (cm_id_ != NULL) {
 		// Any associated QP must be freed before destroying the CM ID.
 		if (rdma_destroy_id(cm_id_)) {
@@ -179,6 +245,21 @@ ServerRDMA::~ServerRDMA() {
 	}
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+	if (argc != 3) {
+		std::cout << "Usage: ./" << argv[0] << " <ip> <port>" << std::endl;
+		std::exit(2);
+	}
+
+	std::size_t pos;
+	int port = std::stoi(argv[2], &pos);
+	std::string ip_addr = argv[1];
+
+	ServerRDMA server;
+	server.Listen(ip_addr, port);
+
+	int connected_clients = server.WaitForClients(1);
+	std::cout << "Num of clients connected: " << connected_clients << std::endl;
+
 	return 0;
 }
