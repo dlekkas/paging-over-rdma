@@ -45,7 +45,7 @@ class ConnectionRDMA {
 class ServerRDMA {
 
  public:
-	ServerRDMA() {}
+	ServerRDMA(): n_conns_(0) {}
 
 	~ServerRDMA();
 
@@ -56,7 +56,7 @@ class ServerRDMA {
 
  private:
 	// Handler of all events communicated through event channel.
-	int cm_event_handler(struct rdma_cm_id *ev_cm_id, struct rdma_cm_event *ev);
+	int cm_event_handler(struct rdma_cm_event *ev);
 
 	// Function to be invoked upon receiving an RDMA connection request (REQ).
 	int on_connect_request(struct rdma_cm_id *client_cm_id,
@@ -117,21 +117,21 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 }
 
 
-int ServerRDMA::cm_event_handler(struct rdma_cm_id *ev_cm_id,
-		struct rdma_cm_event *ev) {
+int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
+	struct rdma_cm_id *ev_cm_id = ev->id;
 	switch (ev->event) {
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 			// Upon receiving a REQ message, we can allocate a QP and accept the
 			// incoming connection request.
 			std::cout << "Received a connection request.\n";
-			on_connect_request(ev->id, &ev->param.conn);
+			on_connect_request(ev_cm_id, &ev->param.conn);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			// Upon receiving a message that connection is established, we can
 			// acknowledge the event back to the client. The call below also frees
 			// the event structure and any memory it references.
 			std::cout << "Connection is established successfully.\n";
-			clients_.push_back({ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd});
+			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			n_conns_++;
 			break;
 		case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -208,8 +208,8 @@ int ServerRDMA::WaitForClients(int n_clients) {
 	// Retrieve communication events until `n_clients` have successfully
 	// established their connection with our server.
 	struct rdma_cm_event *event;
-	while (n_conns_ < n_clients && rdma_get_cm_event(ev_channel_, &event)) {
-		cm_event_handler(cm_id_, event);
+	while (n_conns_ < n_clients && !rdma_get_cm_event(ev_channel_, &event)) {
+		cm_event_handler(event);
 		rdma_ack_cm_event(event);
 	}
 
@@ -222,9 +222,6 @@ int ServerRDMA::WaitForClients(int n_clients) {
 
 
 ServerRDMA::~ServerRDMA() {
-	for (auto& client: clients_) {
-	}
-
 	if (pd_ != NULL) {
 		if (ibv_dealloc_pd(pd_)) {
 			std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
@@ -247,7 +244,7 @@ ServerRDMA::~ServerRDMA() {
 
 int main(int argc, char *argv[]) {
 	if (argc != 3) {
-		std::cout << "Usage: ./" << argv[0] << " <ip> <port>" << std::endl;
+		std::cout << "Usage: " << argv[0] << " <ip> <port>" << std::endl;
 		std::exit(2);
 	}
 
