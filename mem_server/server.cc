@@ -2,6 +2,7 @@
 #include <rdma/rdma_verbs.h>
 #include <infiniband/verbs.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <cerrno>
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
+#define BUFFER_SIZE 8192
 
 class ConnectionRDMA {
  public:
@@ -20,15 +22,15 @@ class ConnectionRDMA {
 		: id(id), qp(qp), pd(pd) {}
 
 	~ConnectionRDMA() {
-		if (pd != nullptr) {
-			if (ibv_dealloc_pd(pd)) {
-				std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
-			}
-		}
-
 		if (qp != nullptr) {
 			if (ibv_destroy_qp(qp)) {
 				std::cerr << "ibv_destroy_qp failed: " << std::strerror(errno) << "\n";
+			}
+		}
+
+		if (pd != nullptr) {
+			if (ibv_dealloc_pd(pd)) {
+				std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
 			}
 		}
 
@@ -60,7 +62,11 @@ class ServerRDMA {
 
 	// Function to be invoked upon receiving an RDMA connection request (REQ).
 	int on_connect_request(struct rdma_cm_id *client_cm_id,
-												  struct rdma_conn_param *conn_params);
+												 struct rdma_conn_param *conn_params);
+
+	// Send memory info to the queue pair specified as argument to inform the
+	// client about the memory address, length and lkey.
+	void send_mem_info(struct ibv_qp *qp);
 
 	// Event channel used to report communication events.
 	struct rdma_event_channel *ev_channel_;
@@ -116,6 +122,32 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	return 0;
 }
 
+void ServerRDMA::send_mem_info(struct ibv_qp *qp) {
+	struct ibv_sge sge;
+	sge.addr = reinterpret_cast<uint64_t>(buf_);
+	sge.length = sizeof(struct ibv_sge);
+	sge.lkey = mr_->lkey;
+
+	struct ibv_send_wr *bad_wr;
+	struct ibv_send_wr wr;
+	wr.wr_id = 0;
+	wr.next = NULL;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.opcode = IBV_WR_SEND;
+	wr.send_flags = IBV_SEND_SIGNALED;
+
+	if (ibv_post_send(qp, &wr, &bad_wr)) {
+		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
+		std::exit(EXIT_FAILURE);
+	}
+
+	struct ibv_wc wc;
+	while (!ibv_poll_cq(qp->send_cq, 1, &wc)) {
+		// nothing
+	}
+}
+
 
 int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 	struct rdma_cm_id *ev_cm_id = ev->id;
@@ -123,14 +155,15 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 			// Upon receiving a REQ message, we can allocate a QP and accept the
 			// incoming connection request.
-			std::cout << "Received a connection request.\n";
 			on_connect_request(ev_cm_id, &ev->param.conn);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			// Upon receiving a message that connection is established, we can
 			// acknowledge the event back to the client. The call below also frees
 			// the event structure and any memory it references.
-			std::cout << "Connection is established successfully.\n";
+			std::cout << "Connection established.\n";
+			send_mem_info(ev_cm_id->qp);
+			std::cout << "Memory info sent.\n";
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			n_conns_++;
 			break;
@@ -201,6 +234,22 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	pd_ = ibv_alloc_pd(cm_id_->verbs);
 	if (pd_ == NULL) {
 		std::cerr << "ibv_alloc_pd() failed: " << std::strerror(errno) << "\n";
+		std::exit(EXIT_FAILURE);
+	}
+
+	buf_ = malloc(BUFFER_SIZE);
+	if (buf_ == nullptr) {
+		std::cerr << "Failed to allocate " << BUFFER_SIZE << " bytes.\n";
+	}
+
+	// By registering our buffer's address, we allow the RDMA device to read/write
+	// data in that region. This call basically pins memory to inform the kernel
+	// that the registered memory is for RDMA communication for the application.
+	mr_ = ibv_reg_mr(pd_, buf_, BUFFER_SIZE, IBV_ACCESS_LOCAL_WRITE |
+																					 IBV_ACCESS_REMOTE_WRITE |
+																					 IBV_ACCESS_REMOTE_READ);
+	if (mr_ == nullptr) {
+		std::cerr << "ibv_reg_mr() failed: " << std::strerror(errno) << "\n";
 	}
 }
 

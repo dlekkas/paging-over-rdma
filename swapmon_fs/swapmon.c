@@ -28,6 +28,9 @@ struct swapmon_rdma_ctrl {
 	// completion queue (CQ)
 	struct ib_cq *cq;
 
+	// remote memory info
+	struct ib_sge *rmem;
+
 	spinlock_t cq_lock;
 
 	enum ib_qp_type qp_type;
@@ -275,11 +278,11 @@ static int swapmon_rdma_route_resolved(void) {
 
   param.private_data = NULL;
   param.private_data_len = 0;
-  param.responder_resources = 16;
-  param.initiator_depth = 16;
-  param.flow_control = 1;
-  param.retry_count = 7;
-  param.rnr_retry_count = 7;
+  param.responder_resources = 8;
+  param.initiator_depth = 8;
+  param.flow_control = 0;
+  param.retry_count = 3;
+  param.rnr_retry_count = 3;
   param.qp_num = ctrl->qp->qp_num;
 
   pr_info("max_qp_rd_atom=%d max_qp_init_rd_atom=%d\n",
@@ -293,8 +296,54 @@ static int swapmon_rdma_route_resolved(void) {
     pr_err("rdma_connect failed (%d)\n", ret);
     ib_free_cq(ctrl->cq);
   }
+	pr_info("trying to rdma_connect() ...\n");
 
   return 0;
+}
+
+static int recv_mem_info(struct ib_qp *qp) {
+	struct ib_recv_wr *bad_wr;
+	struct ib_recv_wr wr;
+	struct ib_sge sge;
+	struct ib_wc wc;
+	struct ib_mr *mr;
+	int ret;
+
+	ctrl->rmem = kzalloc(sizeof(struct ib_sge), GFP_KERNEL);
+	if (!ctrl->rmem) {
+		pr_err("kzalloc failed to allocate mem for struct ib_sge.\n");
+		return -ENOMEM;
+	}
+
+	// TODO(dimlek): think about proper value for 3rd arg
+	mr = ib_alloc_mr(ctrl->pd, IB_MR_TYPE_MEM_REG, 10);
+	if (!mr) {
+		pr_err("ib_alloc_mr failed.\n");
+		return -2;
+	}
+
+	sge.addr = (u64) ctrl->rmem;
+	sge.length = sizeof(struct ib_sge);
+	sge.lkey = mr->lkey;
+
+	wr.next = NULL;
+	wr.wr_id = 0;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+
+	ret = ib_post_recv(qp, &wr, &bad_wr);
+	if (ret) {
+		pr_err("ib_post_recv failed to receive remote mem info.\n");
+		return -1;
+	}
+
+	while (!ib_poll_cq(qp->recv_cq, 1, &wc)) {
+		// nothing
+	}
+	printk("received remote mem info: addr = %llx, len = %u, lkey = %x\n",
+				 ctrl->rmem->addr, ctrl->rmem->length, ctrl->rmem->lkey);
+
+	return 0;
 }
 
 // For connection establishment, a sample sequence consists of a Request (REQ)
@@ -303,6 +352,7 @@ static int swapmon_rdma_route_resolved(void) {
 // the client to the server.
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event) {
+	int ret;
 	int cm_error = 0;
 	printk("rdma_cm_event_handler msg: %s (%d) status %d id $%p\n",
 				 rdma_event_msg(event->event), event->event, event->status, id);
@@ -316,6 +366,13 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			pr_info("connection established successfully\n");
+			// Wait to receive memory info to retrieve all required info to properly
+			// reference remote memory.
+			ret = recv_mem_info(id->qp);
+			if (ret) {
+				pr_err("unable to receive remote mem info.\n");
+			}
+
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);
 			break;
@@ -386,6 +443,7 @@ static int swapmon_rdma_create_ctrl(void) {
 		return -EINVAL;
 	}
 	ctrl->server_addr.sin_port = cpu_to_be16(server_port);
+	ctrl->server_addr.sin_port = cpu_to_be16(10000);
 
 	ret = swapmon_rdma_parse_ipaddr(&(ctrl->client_addr), client_ip);
 	if (ret) {
@@ -426,7 +484,7 @@ static int swapmon_rdma_create_ctrl(void) {
 
 	pr_info("rdma_resolve_addr completed successfully.\n");
 	// TODO(dimlek): remove this ret statement when everything is ok.
-	return 0;
+	// return 0;
 
 	ret = swapmon_rdma_wait_for_cm();
 	if (ret) {
@@ -463,7 +521,7 @@ static int rdma_conn_init(void) {
 	return 0;
 
 err_unreg_client:
-	ib_unregister_client(&swapmon_ib_client);
+	// ib_unregister_client(&swapmon_ib_client);
 	return ret;
 }
 
