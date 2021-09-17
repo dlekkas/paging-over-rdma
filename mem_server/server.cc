@@ -10,12 +10,15 @@
 #include <cerrno>
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
-#define BUFFER_SIZE 8192
+
+constexpr uint64_t BUFFER_SIZE(8192);
 
 class ConnectionRDMA {
  public:
 	struct rdma_cm_id* id;
 	struct ibv_qp* qp;
+
+	// Ownernship of protection domain is on ServerRDMA (i.e. do not destroy here)
 	struct ibv_pd* pd;
 
 	ConnectionRDMA(struct rdma_cm_id *id, struct ibv_qp *qp, struct ibv_pd* pd)
@@ -25,12 +28,6 @@ class ConnectionRDMA {
 		if (qp != nullptr) {
 			if (ibv_destroy_qp(qp)) {
 				std::cerr << "ibv_destroy_qp failed: " << std::strerror(errno) << "\n";
-			}
-		}
-
-		if (pd != nullptr) {
-			if (ibv_dealloc_pd(pd)) {
-				std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
 			}
 		}
 
@@ -66,7 +63,7 @@ class ServerRDMA {
 
 	// Send memory info to the queue pair specified as argument to inform the
 	// client about the memory address, length and lkey.
-	void send_mem_info(struct ibv_qp *qp);
+	int send_mem_info(struct ibv_qp *qp);
 
 	// Event channel used to report communication events.
 	struct rdma_event_channel *ev_channel_;
@@ -122,10 +119,18 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	return 0;
 }
 
-void ServerRDMA::send_mem_info(struct ibv_qp *qp) {
+int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
+	struct ibv_sge mem_info;
+	mem_info.addr = reinterpret_cast<uint64_t>(buf_);
+	mem_info.length = BUFFER_SIZE;
+	mem_info.lkey = mr_->rkey;
+
+	std::cout << "Sending memory info: addr = " << mem_info.addr << ", len = "
+						<< mem_info.length << ", key = " << mem_info.lkey << "\n";
+
 	struct ibv_sge sge;
-	sge.addr = reinterpret_cast<uint64_t>(buf_);
-	sge.length = sizeof(struct ibv_sge);
+	sge.addr = reinterpret_cast<uint64_t>(&mem_info);
+	sge.length = sizeof(mem_info);
 	sge.lkey = mr_->lkey;
 
 	struct ibv_send_wr *bad_wr;
@@ -135,17 +140,25 @@ void ServerRDMA::send_mem_info(struct ibv_qp *qp) {
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 	wr.opcode = IBV_WR_SEND;
-	wr.send_flags = IBV_SEND_SIGNALED;
+	wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
 
 	if (ibv_post_send(qp, &wr, &bad_wr)) {
 		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
-		std::exit(EXIT_FAILURE);
+		return -1;
 	}
 
 	struct ibv_wc wc;
 	while (!ibv_poll_cq(qp->send_cq, 1, &wc)) {
 		// nothing
 	}
+
+	if (wc.status != IBV_WC_SUCCESS) {
+		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
+							<< ", work request ID: " << wc.wr_id << std::endl;
+		return -1;
+	}
+
+	return 0;
 }
 
 
@@ -162,8 +175,11 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			// acknowledge the event back to the client. The call below also frees
 			// the event structure and any memory it references.
 			std::cout << "Connection established.\n";
-			send_mem_info(ev_cm_id->qp);
-			std::cout << "Memory info sent.\n";
+			if (send_mem_info(ev_cm_id->qp)) {
+				std::cout << "Failed to exchange memory region info.\n";
+			} else {
+				std::cout << "Memory region info sent successfully.\n";
+			}
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			n_conns_++;
 			break;
@@ -191,7 +207,7 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 
 void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	ev_channel_ = rdma_create_event_channel();
-	if (ev_channel_ == NULL) {
+	if (ev_channel_ == nullptr) {
 		std::cerr << "rdma_create_event_channel() failed: "
 							<< std::strerror(errno) << "\n";
 		std::exit(EXIT_FAILURE);
@@ -232,7 +248,7 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	std::cout << "Listening in port " << std::to_string(listen_port) << "\n";
 
 	pd_ = ibv_alloc_pd(cm_id_->verbs);
-	if (pd_ == NULL) {
+	if (pd_ == nullptr) {
 		std::cerr << "ibv_alloc_pd() failed: " << std::strerror(errno) << "\n";
 		std::exit(EXIT_FAILURE);
 	}
@@ -271,13 +287,20 @@ int ServerRDMA::WaitForClients(int n_clients) {
 
 
 ServerRDMA::~ServerRDMA() {
-	if (pd_ != NULL) {
+	if (mr_ != nullptr) {
+		if (ibv_dereg_mr(mr_)) {
+			std::cerr << "ibv_dereg_mr failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	// A PD cannot be destroyed if any QP, region, or AH is still a member of it.
+	if (pd_ != nullptr) {
 		if (ibv_dealloc_pd(pd_)) {
 			std::cerr << "ibv_dealloc_pd failed: " << std::strerror(errno) << "\n";
 		}
 	}
 
-	if (cm_id_ != NULL) {
+	if (cm_id_ != nullptr) {
 		// Any associated QP must be freed before destroying the CM ID.
 		if (rdma_destroy_id(cm_id_)) {
 			std::cerr << "rdma_destroy_id failed: " << std::strerror(errno) << "\n";
@@ -286,7 +309,7 @@ ServerRDMA::~ServerRDMA() {
 
 	// All rdma_cm_id's associated with the event channel must be destroyed, and
 	// all returned events must be acked before destroying the channel.
-	if (ev_channel_ != NULL) {
+	if (ev_channel_ != nullptr) {
 		rdma_destroy_event_channel(ev_channel_);
 	}
 }

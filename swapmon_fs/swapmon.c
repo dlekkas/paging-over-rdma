@@ -317,9 +317,9 @@ static int recv_mem_info(struct ib_qp *qp) {
 
 	// TODO(dimlek): think about proper value for 3rd arg
 	mr = ib_alloc_mr(ctrl->pd, IB_MR_TYPE_MEM_REG, 10);
-	if (!mr) {
+	if (IS_ERR(mr)) {
 		pr_err("ib_alloc_mr failed.\n");
-		return -2;
+		return PTR_ERR(mr);
 	}
 
 	sge.addr = (u64) ctrl->rmem;
@@ -334,13 +334,13 @@ static int recv_mem_info(struct ib_qp *qp) {
 	ret = ib_post_recv(qp, &wr, &bad_wr);
 	if (ret) {
 		pr_err("ib_post_recv failed to receive remote mem info.\n");
-		return -1;
+		return ret;
 	}
 
 	while (!ib_poll_cq(qp->recv_cq, 1, &wc)) {
 		// nothing
 	}
-	printk("received remote mem info: addr = %llx, len = %u, lkey = %x\n",
+	printk("received remote mem info: addr = %llx, len = %u, key = %x\n",
 				 ctrl->rmem->addr, ctrl->rmem->length, ctrl->rmem->lkey);
 
 	return 0;
