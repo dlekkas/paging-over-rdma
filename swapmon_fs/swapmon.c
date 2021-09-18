@@ -18,6 +18,13 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
+
+struct rm_info {
+	u64 addr;
+	u32 len;
+	u32 key;
+};
+
 struct swapmon_rdma_ctrl {
 	struct ib_device *dev;
 
@@ -29,7 +36,7 @@ struct swapmon_rdma_ctrl {
 	struct ib_cq *cq;
 
 	// remote memory info
-	struct ib_sge *rmem;
+	struct rm_info *rmem;
 
 	spinlock_t cq_lock;
 
@@ -306,25 +313,29 @@ static int recv_mem_info(struct ib_qp *qp) {
 	struct ib_recv_wr wr;
 	struct ib_sge sge;
 	struct ib_wc wc;
-	struct ib_mr *mr;
+	u64 dma_addr;
 	int ret;
 
-	ctrl->rmem = kzalloc(sizeof(struct ib_sge), GFP_KERNEL);
+	ctrl->rmem = kzalloc(sizeof(struct rm_info), GFP_KERNEL);
 	if (!ctrl->rmem) {
-		pr_err("kzalloc failed to allocate mem for struct ib_sge.\n");
+		pr_err("kzalloc failed to allocate mem for struct rm_info.\n");
 		return -ENOMEM;
 	}
 
-	// TODO(dimlek): think about proper value for 3rd arg
-	mr = ib_alloc_mr(ctrl->pd, IB_MR_TYPE_MEM_REG, 10);
-	if (IS_ERR(mr)) {
-		pr_err("ib_alloc_mr failed.\n");
-		return PTR_ERR(mr);
+	// Map kernel virtual address `ctrl->rmem` to a DMA address.
+	dma_addr = ib_dma_map_single(ctrl->dev, ctrl->rmem,
+			sizeof(struct rm_info), DMA_FROM_DEVICE);
+	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+		pr_err("dma address mapping error.\n");
 	}
 
-	sge.addr = (u64) ctrl->rmem;
-	sge.length = sizeof(struct ib_sge);
-	sge.lkey = mr->lkey;
+	// Prepare DMA region to be accessed by device.
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			sizeof(struct rm_info), DMA_FROM_DEVICE);
+
+	sge.addr = dma_addr;
+	sge.length = sizeof(struct rm_info);
+	sge.lkey = ctrl->pd->local_dma_lkey;
 
 	wr.next = NULL;
 	wr.wr_id = 0;
@@ -340,8 +351,14 @@ static int recv_mem_info(struct ib_qp *qp) {
 	while (!ib_poll_cq(qp->recv_cq, 1, &wc)) {
 		// nothing
 	}
-	printk("received remote mem info: addr = %llx, len = %u, key = %x\n",
-				 ctrl->rmem->addr, ctrl->rmem->length, ctrl->rmem->lkey);
+	printk("received remote mem info: addr = %llu, len = %u, key = %u\n",
+				 ctrl->rmem->addr, ctrl->rmem->len, ctrl->rmem->key);
+
+	if (wc.status != IB_WC_SUCCESS) {
+		printk("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc.status), wc.wr_id);
+		return wc.status;
+	}
 
 	return 0;
 }
