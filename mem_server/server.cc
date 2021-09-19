@@ -2,6 +2,8 @@
 #include <rdma/rdma_verbs.h>
 #include <infiniband/verbs.h>
 
+#include <unistd.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -11,7 +13,12 @@
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
 
-constexpr uint64_t BUFFER_SIZE(8192);
+// Memory size allocated for remote peers.
+constexpr std::size_t BUFFER_SIZE(16 * 4096);
+
+// Completion Queue (CQ) will contain at least `MIN_CQE` entries.
+constexpr int MIN_CQE(8192);
+
 
 class ConnectionRDMA {
  public:
@@ -52,6 +59,8 @@ class ServerRDMA {
 
 	int WaitForClients(int n_clients);
 
+	int InitUDP();
+
 
  private:
 	// Handler of all events communicated through event channel.
@@ -60,6 +69,8 @@ class ServerRDMA {
 	// Function to be invoked upon receiving an RDMA connection request (REQ).
 	int on_connect_request(struct rdma_cm_id *client_cm_id,
 												 struct rdma_conn_param *conn_params);
+
+	int setup_mem_region(std::size_t buf_size);
 
 	// Send memory info to the queue pair specified as argument to inform the
 	// client about the memory address, length and lkey.
@@ -70,6 +81,10 @@ class ServerRDMA {
 
 	// Communication Manager ID used to track connection communication info.
 	struct rdma_cm_id *cm_id_;
+
+	struct ibv_cq *cq_;
+
+	struct ibv_srq *srq_;
 
 	struct ibv_mr *mr_;
 
@@ -84,11 +99,19 @@ class ServerRDMA {
 	int n_conns_;
 };
 
+int ServerRDMA::InitUDP() {
+
+	return 0;
+}
+
 
 int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 		struct rdma_conn_param *param) {
 	struct ibv_qp_init_attr attr;
 	std::memset(&attr, 0, sizeof(attr));
+	attr.send_cq = cq_;
+	attr.recv_cq = cq_;
+	attr.srq = NULL;
 	attr.cap.max_send_wr = 6;
 	attr.cap.max_recv_wr = 6;
 	attr.cap.max_send_sge = 1;
@@ -204,6 +227,38 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 	return 0;
 }
 
+int ServerRDMA::setup_mem_region(std::size_t buf_size) {
+	pd_ = ibv_alloc_pd(cm_id_->verbs);
+	if (pd_ == nullptr) {
+		std::cerr << "ibv_alloc_pd() failed: " << std::strerror(errno) << "\n";
+		return -1;
+	}
+
+	// ensure page aligned memory for better performance
+	std::size_t page_sz = sysconf(_SC_PAGESIZE);
+	if (BUFFER_SIZE % page_sz != 0) {
+		std::cerr << "Total mem size not a multiple of page size.\n";
+	}
+
+	buf_ = aligned_alloc(page_sz, BUFFER_SIZE);
+	if (buf_ == nullptr) {
+		std::cerr << "Failed to allocate " << BUFFER_SIZE << " bytes.\n";
+		return -1;
+	}
+
+	// By registering our buffer's address, we allow the RDMA device to read/write
+	// data in that region. This call basically pins memory to inform the kernel
+	// that the registered memory is for RDMA communication for the application.
+	mr_ = ibv_reg_mr(pd_, buf_, BUFFER_SIZE, IBV_ACCESS_LOCAL_WRITE |
+																					 IBV_ACCESS_REMOTE_WRITE |
+																					 IBV_ACCESS_REMOTE_READ);
+	if (mr_ == nullptr) {
+		std::cerr << "ibv_reg_mr() failed: " << std::strerror(errno) << "\n";
+		return -1;
+	}
+	return 0;
+}
+
 
 void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	ev_channel_ = rdma_create_event_channel();
@@ -247,25 +302,28 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	int listen_port = ntohs(rdma_get_src_port(cm_id_));
 	std::cout << "Listening in port " << std::to_string(listen_port) << "\n";
 
-	pd_ = ibv_alloc_pd(cm_id_->verbs);
-	if (pd_ == nullptr) {
-		std::cerr << "ibv_alloc_pd() failed: " << std::strerror(errno) << "\n";
+	if (setup_mem_region(BUFFER_SIZE)) {
+		std::cerr << "Setting up memory failed.\n";
 		std::exit(EXIT_FAILURE);
 	}
 
-	buf_ = malloc(BUFFER_SIZE);
-	if (buf_ == nullptr) {
-		std::cerr << "Failed to allocate " << BUFFER_SIZE << " bytes.\n";
+	// TODO(dimlek): think about init values
+	struct ibv_srq_init_attr srq_init_attr = {};
+	// Max number of outstanding work requests in the SRQ.
+	srq_init_attr.attr.max_wr = 16;
+	// Max number of scatter/gather entries per work request (WR). Here we only
+	// want to allow empty messages.
+	srq_init_attr.attr.max_sge = 0;
+	srq_ = ibv_create_srq(pd_, &srq_init_attr);
+	if (!srq_) {
+		std::cerr << "ibv_create_srq failed: " << std::strerror(errno) << "\n";
+		std::exit(EXIT_FAILURE);
 	}
 
-	// By registering our buffer's address, we allow the RDMA device to read/write
-	// data in that region. This call basically pins memory to inform the kernel
-	// that the registered memory is for RDMA communication for the application.
-	mr_ = ibv_reg_mr(pd_, buf_, BUFFER_SIZE, IBV_ACCESS_LOCAL_WRITE |
-																					 IBV_ACCESS_REMOTE_WRITE |
-																					 IBV_ACCESS_REMOTE_READ);
-	if (mr_ == nullptr) {
-		std::cerr << "ibv_reg_mr() failed: " << std::strerror(errno) << "\n";
+	cq_ = ibv_create_cq(pd_->context, MIN_CQE, NULL, NULL, 0);
+	if (!cq_) {
+		std::cerr << "ibv_create_cq failed: " << std::strerror(errno) << "\n";
+		std::exit(EXIT_FAILURE);
 	}
 }
 
