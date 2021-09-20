@@ -12,6 +12,7 @@
 #include <cerrno>
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
+#define UDP_QKEY 0x11111111
 
 // Memory size allocated for remote peers.
 constexpr std::size_t BUFFER_SIZE(16 * 4096);
@@ -90,6 +91,8 @@ class ServerRDMA {
 
 	struct ibv_pd *pd_;
 
+	struct ibv_qp *ud_qp_;
+
 	void *buf_;
 
 	// Vector of the RDMA CM ids of the connected clients.
@@ -100,6 +103,59 @@ class ServerRDMA {
 };
 
 int ServerRDMA::InitUDP() {
+	// TODO(dimlek): tune the attributes below
+	struct ibv_qp_init_attr init_attr;
+	std::memset(&init_attr, 0, sizeof(init_attr));
+	init_attr.send_cq = cq_;
+	init_attr.recv_cq = cq_;
+	init_attr.srq = NULL;
+	init_attr.qp_type = IBV_QPT_UD;
+
+	// We only receive UC messages, but we reply only with RC.
+	init_attr.cap.max_send_wr = 0;
+	init_attr.cap.max_recv_wr = 8192;
+	init_attr.cap.max_send_sge = 0;
+	init_attr.cap.max_recv_sge = 2;
+
+	ud_qp_ = ibv_create_qp(pd_, &init_attr);
+	if (!ud_qp_) {
+		std::cerr << "ibv_create_qp for UD failed: "
+							<< std::strerror(errno) << "\n";
+		return -1;
+	}
+
+	struct ibv_qp_attr attr;
+	std::memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_INIT;
+	attr.port_num = cm_id_->port_num;
+
+	// Partition Key (P_Key): The partition key provides isolation between nodes
+	// and create "virtual fabrics" that only QPs belonging to the same partition
+	// can communicate and at least one of those QPs should be a full member of
+	// this partition (i.e. having MSB = 1).
+	__be16 pkey = cm_id_->route.addr.addr.ibaddr.pkey;
+
+	attr.pkey_index = ibv_get_pkey_index(pd_->context, cm_id_->port_num, pkey);
+
+	// Queue Key (Q_Key): An Unreliable Datagram (UD) queue pair will get unicast
+	// or multicast messages from a remote UD QP only if the Q_key of the message
+	// is equal to the Q_key value of this UD QP. The remote peer that will send
+	// msg to this QP should specify the same Q_key as below.
+	attr.qkey = UDP_QKEY;
+
+	if (ibv_modify_qp(ud_qp_, &attr,
+				IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY)) {
+		std::cerr << "ibv_modify_qp failed to move QP to state INIT.\n";
+		return -2;
+	}
+
+	std::memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTR;
+
+	if (ibv_modify_qp(ud_qp_, &attr, IBV_QP_STATE)) {
+		std::cerr << "ibv_modify_qp failed to move QP to state RTR.\n";
+		return -3;
+	}
 
 	return 0;
 }

@@ -25,6 +25,17 @@ struct rm_info {
 	u32 key;
 };
 
+struct remote_peer_info {
+	union ib_gid gid;
+	u32 lid;
+
+	u32 qpn;
+	// use ib_find_pkey() to find the index of a given pkey
+	u32 qkey;
+	// default IB_DEFAULT_PKEY_FULL -> defined in <rdma/ib_mad.h>
+	u32 pkey;
+};
+
 struct swapmon_rdma_ctrl {
 	struct ib_device *dev;
 
@@ -37,6 +48,10 @@ struct swapmon_rdma_ctrl {
 
 	// remote memory info
 	struct rm_info *rmem;
+
+	struct remote_peer_info rpeer;
+
+	struct ib_ah *ah;
 
 	spinlock_t cq_lock;
 
@@ -359,6 +374,8 @@ static int recv_mem_info(struct ib_qp *qp) {
 					 ib_wc_status_msg(wc.status), wc.wr_id);
 		return wc.status;
 	}
+
+
 
 	return 0;
 }
