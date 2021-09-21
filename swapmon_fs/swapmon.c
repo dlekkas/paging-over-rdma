@@ -19,13 +19,13 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
 
-struct rm_info {
+struct mem_info {
 	u64 addr;
 	u32 len;
 	u32 key;
 };
 
-struct remote_peer_info {
+struct ud_transport_info {
 	union ib_gid gid;
 	u32 lid;
 
@@ -34,6 +34,11 @@ struct remote_peer_info {
 	u32 qkey;
 	// default IB_DEFAULT_PKEY_FULL -> defined in <rdma/ib_mad.h>
 	u32 pkey;
+};
+
+struct server_info {
+	struct mem_info mem;
+	struct ud_transport_info ud_transport;
 };
 
 struct swapmon_rdma_ctrl {
@@ -46,10 +51,7 @@ struct swapmon_rdma_ctrl {
 	// completion queue (CQ)
 	struct ib_cq *cq;
 
-	// remote memory info
-	struct rm_info *rmem;
-
-	struct remote_peer_info rpeer;
+	struct server_info server;
 
 	struct ib_ah *ah;
 
@@ -331,25 +333,34 @@ static int recv_mem_info(struct ib_qp *qp) {
 	u64 dma_addr;
 	int ret;
 
-	ctrl->rmem = kzalloc(sizeof(struct rm_info), GFP_KERNEL);
-	if (!ctrl->rmem) {
-		pr_err("kzalloc failed to allocate mem for struct rm_info.\n");
+	struct server_info {
+		u64 addr;
+		u32 len;
+		u32 key;
+		u32 qpn;
+	};
+
+	struct server_info *msg;
+
+	msg = kzalloc(sizeof(struct server_info), GFP_KERNEL);
+	if (!msg) {
+		pr_err("kzalloc failed to allocate mem for struct server_info.\n");
 		return -ENOMEM;
 	}
 
 	// Map kernel virtual address `ctrl->rmem` to a DMA address.
-	dma_addr = ib_dma_map_single(ctrl->dev, ctrl->rmem,
-			sizeof(struct rm_info), DMA_FROM_DEVICE);
+	dma_addr = ib_dma_map_single(ctrl->dev, msg,
+			sizeof(struct server_info), DMA_FROM_DEVICE);
 	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
 		pr_err("dma address mapping error.\n");
 	}
 
 	// Prepare DMA region to be accessed by device.
 	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
-			sizeof(struct rm_info), DMA_FROM_DEVICE);
+			sizeof(struct server_info), DMA_FROM_DEVICE);
 
 	sge.addr = dma_addr;
-	sge.length = sizeof(struct rm_info);
+	sge.length = sizeof(struct server_info);
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
 	wr.next = NULL;
@@ -366,8 +377,6 @@ static int recv_mem_info(struct ib_qp *qp) {
 	while (!ib_poll_cq(qp->recv_cq, 1, &wc)) {
 		// nothing
 	}
-	printk("received remote mem info: addr = %llu, len = %u, key = %u\n",
-				 ctrl->rmem->addr, ctrl->rmem->len, ctrl->rmem->key);
 
 	if (wc.status != IB_WC_SUCCESS) {
 		printk("Polling failed with status %s (work request ID = %llu).\n",
@@ -375,7 +384,18 @@ static int recv_mem_info(struct ib_qp *qp) {
 		return wc.status;
 	}
 
+	ctrl->server.mem.addr = msg->addr;
+	ctrl->server.mem.len  = msg->len;
+	ctrl->server.mem.key  = msg->key;
+	pr_info("remote mem info: addr = %llu, len = %u, key = %u\n",
+				  ctrl->server.mem.addr, ctrl->server.mem.len,
+					ctrl->server.mem.key);
 
+	ctrl->server.ud_transport.qpn = msg->qpn;
+
+	union ib_gid gid = ctrl->cm_id->route.path_rec->dgid;
+	pr_info("dgid = %16phC, dlid = 0x%x, qpn = %u\n",
+			gid.raw, wc.slid, ctrl->server.ud_transport.qpn);
 
 	return 0;
 }

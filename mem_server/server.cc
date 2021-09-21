@@ -13,6 +13,7 @@
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
 #define UDP_QKEY 0x11111111
+#define IBV_DEFAULT_PKEY_FULL 0xFFFF
 
 // Memory size allocated for remote peers.
 constexpr std::size_t BUFFER_SIZE(16 * 4096);
@@ -77,6 +78,8 @@ class ServerRDMA {
 	// client about the memory address, length and lkey.
 	int send_mem_info(struct ibv_qp *qp);
 
+	int extract_pkey_index(uint8_t port_num, __be16 pkey);
+
 	// Event channel used to report communication events.
 	struct rdma_event_channel *ev_channel_;
 
@@ -101,6 +104,24 @@ class ServerRDMA {
 	// Number of accepted connections.
 	int n_conns_;
 };
+
+int ServerRDMA::extract_pkey_index(uint8_t port_num, __be16 pkey) {
+	struct ibv_port_attr port_info = {};
+	if (ibv_query_port(pd_->context, port_num, &port_info)) {
+		std::cerr << "ibv_query_port failed: " << std::strerror(errno) << "\n";
+		return -1;
+	}
+
+	for (uint16_t i = 0; i < port_info.pkey_tbl_len; i++) {
+		uint16_t curr_pkey;
+		if (ibv_query_pkey(pd_->context, port_num, i, &curr_pkey) == 1 &&
+				curr_pkey == pkey) {
+			return i;
+		}
+	}
+
+	return -1;
+}
 
 int ServerRDMA::InitUDP() {
 	// TODO(dimlek): tune the attributes below
@@ -134,8 +155,23 @@ int ServerRDMA::InitUDP() {
 	// can communicate and at least one of those QPs should be a full member of
 	// this partition (i.e. having MSB = 1).
 	__be16 pkey = cm_id_->route.addr.addr.ibaddr.pkey;
+	attr.pkey_index = extract_pkey_index(cm_id_->port_num, pkey);
+	if (attr.pkey_index < 0) {
+		std::cerr << "extract_pkey_index(" << cm_id_->port_num << ", "
+							<< pkey << ") failed.\n";
+		// try out the default full membership P_Key (0xFFFF) because each P_Key
+		// table has at least this valid key
+		attr.pkey_index = extract_pkey_index(cm_id_->port_num,
+				IBV_DEFAULT_PKEY_FULL);
+		if (attr.pkey_index < 0) {
+			std::cerr << "extract_pkey_index(" << cm_id_->port_num << ", "
+								<< pkey << ") failed.\n";
+			return -2;
+		}
+	}
 
-	attr.pkey_index = ibv_get_pkey_index(pd_->context, cm_id_->port_num, pkey);
+	std::cout << "qpn = " << ud_qp_->qp_num << ", pkey_index = " <<
+							 attr.pkey_index << ", port_num = " << attr.port_num << "\n";
 
 	// Queue Key (Q_Key): An Unreliable Datagram (UD) queue pair will get unicast
 	// or multicast messages from a remote UD QP only if the Q_key of the message
@@ -146,7 +182,7 @@ int ServerRDMA::InitUDP() {
 	if (ibv_modify_qp(ud_qp_, &attr,
 				IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY)) {
 		std::cerr << "ibv_modify_qp failed to move QP to state INIT.\n";
-		return -2;
+		return -3;
 	}
 
 	std::memset(&attr, 0, sizeof(attr));
@@ -199,17 +235,30 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 }
 
 int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
-	struct ibv_sge mem_info;
-	mem_info.addr = reinterpret_cast<uint64_t>(buf_);
-	mem_info.length = BUFFER_SIZE;
-	mem_info.lkey = mr_->rkey;
 
-	std::cout << "Sending memory info: addr = " << mem_info.addr << ", len = "
-						<< mem_info.length << ", key = " << mem_info.lkey << "\n";
+	std::cout << "Invoking InitUDP()\n";
+	InitUDP();
+	std::cout << "InitUDP() completed.\n";
+
+	struct {
+		uint64_t addr;
+		uint32_t len;
+		uint32_t key;
+		uint32_t qpn;
+	} server_info_msg;
+
+	server_info_msg.addr = reinterpret_cast<uint64_t>(buf_);
+	server_info_msg.len = BUFFER_SIZE;
+	server_info_msg.key = mr_->rkey;
+	server_info_msg.qpn = ud_qp_->qp_num;
+
+	std::cout << "Sending memory info: addr = " << server_info_msg.addr
+						<< ", len = " << server_info_msg.len
+						<< ", key = " << server_info_msg.key << "\n";
 
 	struct ibv_sge sge;
-	sge.addr = reinterpret_cast<uint64_t>(&mem_info);
-	sge.length = sizeof(mem_info);
+	sge.addr = reinterpret_cast<uint64_t>(&server_info_msg);
+	sge.length = sizeof(server_info_msg);
 	sge.lkey = mr_->lkey;
 
 	struct ibv_send_wr *bad_wr;
