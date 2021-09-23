@@ -8,11 +8,12 @@
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
+#include <rdma/ib_mad.h>
 
 #include <linux/init.h>
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
-
+#define UC_QKEY 0x11111111
 
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
@@ -26,9 +27,12 @@ struct mem_info {
 };
 
 struct ud_transport_info {
+	// The GID that is used to identify the destination port of the packets
 	union ib_gid gid;
+	// If destination is on same subnet, the LID of the port to which the
+	// subnet delivers the packets to
 	u32 lid;
-
+	// The QP number of the remote UC QP
 	u32 qpn;
 	// use ib_find_pkey() to find the index of a given pkey
 	u32 qkey;
@@ -325,6 +329,53 @@ static int swapmon_rdma_route_resolved(void) {
   return 0;
 }
 
+static int init_ud_comms(void) {
+	struct ib_qp* ud_qp;
+	struct ib_qp_attr qp_attr;
+	struct ib_qp_init_attr qp_init_attr = {};
+	int ret;
+
+	qp_init_attr.send_cq = ctrl->cq;
+	qp_init_attr.recv_cq = ctrl->cq;
+	qp_init_attr.cap.max_send_wr  = 128;
+	qp_init_attr.cap.max_recv_wr  = 0;
+	qp_init_attr.cap.max_send_sge = 1;
+	qp_init_attr.cap.max_recv_sge = 0;
+	qp_init_attr.qp_type = IB_QPT_UD;
+
+	ud_qp = ib_create_qp(ctrl->pd, &qp_init_attr);
+	if (IS_ERR(ud_qp)) {
+		pr_err("ib_create_qp for UD communication failed.\n");
+		return PTR_ERR(ud_qp);
+	}
+
+	memset(&qp_attr, 0, sizeof(qp_attr));
+	qp_attr.qp_state   = IB_QPS_INIT;
+
+
+	ret = ib_find_pkey(ctrl->dev, ctrl->cm_id->port_num,
+				ctrl->server.ud_transport.pkey, &qp_attr.pkey_index);
+	if (ret) {
+		pr_err("ib_find_pkey (port_num=%u,pkey=%u) failed.\n",
+				ctrl->cm_id->port_num, ctrl->server.ud_transport.pkey);
+		return ret;
+	}
+	qp_attr.port_num = ctrl->cm_id->port_num;
+	qp_attr.qkey = ctrl->server.ud_transport.qkey;
+
+	ret = ib_modify_qp(ud_qp, &qp_attr,
+			IB_QP_STATE | IB_QP_PKEY_INDEX | IB_QP_PORT | IB_QP_QKEY);
+	if (ret) {
+		pr_err("ib_modify_qp failed to move QP to state INIT.\n");
+		return ret;
+	}
+
+	pr_info("port_num = %u, qkey = %u, pkey_index = %u\n",
+			qp_attr.port_num, qp_attr.qkey, qp_attr.pkey_index);
+
+	return 0;
+}
+
 static int recv_mem_info(struct ib_qp *qp) {
 	struct ib_recv_wr *bad_wr;
 	struct ib_recv_wr wr;
@@ -341,7 +392,6 @@ static int recv_mem_info(struct ib_qp *qp) {
 	};
 
 	struct server_info *msg;
-
 	msg = kzalloc(sizeof(struct server_info), GFP_KERNEL);
 	if (!msg) {
 		pr_err("kzalloc failed to allocate mem for struct server_info.\n");
@@ -387,15 +437,19 @@ static int recv_mem_info(struct ib_qp *qp) {
 	ctrl->server.mem.addr = msg->addr;
 	ctrl->server.mem.len  = msg->len;
 	ctrl->server.mem.key  = msg->key;
-	pr_info("remote mem info: addr = %llu, len = %u, key = %u\n",
-				  ctrl->server.mem.addr, ctrl->server.mem.len,
-					ctrl->server.mem.key);
+	pr_info("Remote mem info: addr = %llu, len = %u, key = %u\n",
+			ctrl->server.mem.addr, ctrl->server.mem.len, ctrl->server.mem.key);
 
-	ctrl->server.ud_transport.qpn = msg->qpn;
-
-	union ib_gid gid = ctrl->cm_id->route.path_rec->dgid;
-	pr_info("dgid = %16phC, dlid = 0x%x, qpn = %u\n",
-			gid.raw, wc.slid, ctrl->server.ud_transport.qpn);
+	ctrl->server.ud_transport.qpn  = msg->qpn;
+	ctrl->server.ud_transport.gid  = ctrl->cm_id->route.path_rec->dgid;
+	ctrl->server.ud_transport.lid  = wc.slid;
+	ctrl->server.ud_transport.qkey = UC_QKEY;
+	ctrl->server.ud_transport.pkey = IB_DEFAULT_PKEY_FULL;
+	pr_info("UD transport info: dgid = %16phC, dlid = 0x%x, "
+			"qpn = %u,  qkey= %u, pkey = %u\n",
+			ctrl->server.ud_transport.gid.raw, ctrl->server.ud_transport.lid,
+			ctrl->server.ud_transport.qpn, ctrl->server.ud_transport.qkey,
+			ctrl->server.ud_transport.pkey);
 
 	return 0;
 }
@@ -426,6 +480,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			if (ret) {
 				pr_err("unable to receive remote mem info.\n");
 			}
+			init_ud_comms();
 
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);

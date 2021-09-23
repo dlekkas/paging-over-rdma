@@ -12,7 +12,7 @@
 #include <cerrno>
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
-#define UDP_QKEY 0x11111111
+#define UD_QKEY 0x11111111
 #define IBV_DEFAULT_PKEY_FULL 0xFFFF
 
 // Memory size allocated for remote peers.
@@ -112,8 +112,8 @@ int ServerRDMA::extract_pkey_index(uint8_t port_num, __be16 pkey) {
 		return -1;
 	}
 
+	__be16 curr_pkey;
 	for (uint16_t i = 0; i < port_info.pkey_tbl_len; i++) {
-		uint16_t curr_pkey;
 		if (ibv_query_pkey(pd_->context, port_num, i, &curr_pkey) == 1 &&
 				curr_pkey == pkey) {
 			return i;
@@ -148,40 +148,62 @@ int ServerRDMA::InitUDP() {
 	struct ibv_qp_attr attr;
 	std::memset(&attr, 0, sizeof(attr));
 	attr.qp_state = IBV_QPS_INIT;
-	attr.port_num = cm_id_->port_num;
 
 	// Partition Key (P_Key): The partition key provides isolation between nodes
 	// and create "virtual fabrics" that only QPs belonging to the same partition
 	// can communicate and at least one of those QPs should be a full member of
 	// this partition (i.e. having MSB = 1).
+	/*
 	__be16 pkey = cm_id_->route.addr.addr.ibaddr.pkey;
 	attr.pkey_index = extract_pkey_index(cm_id_->port_num, pkey);
 	if (attr.pkey_index < 0) {
-		std::cerr << "extract_pkey_index(" << cm_id_->port_num << ", "
+		std::cerr << "extract_pkey_index(" << +cm_id_->port_num << ", "
 							<< pkey << ") failed.\n";
 		// try out the default full membership P_Key (0xFFFF) because each P_Key
 		// table has at least this valid key
 		attr.pkey_index = extract_pkey_index(cm_id_->port_num,
 				IBV_DEFAULT_PKEY_FULL);
 		if (attr.pkey_index < 0) {
-			std::cerr << "extract_pkey_index(" << cm_id_->port_num << ", "
+			std::cerr << "extract_pkey_index(" << +cm_id_->port_num << ", "
 								<< pkey << ") failed.\n";
 			return -2;
 		}
 	}
+	*/
+	/*
+	struct ibv_qp_attr uc_qp_attr;
+	struct ibv_qp_init_attr tmp_attr;
+	if(ibv_query_qp(cm_id_->qp, &uc_qp_attr, IBV_QP_PKEY_INDEX, &tmp_attr)) {
+		std::cerr << "ibv_query_qp failed: " << std::strerror(errno) << "\n";
+	}
+	// attr.pkey_index = uc_qp_attr.pkey_index;
+	if (cm_id_->qp == nullptr) {
+		std::cerr << "cm_id_->qp is NULL.\n";
+	}
+	*/
+	attr.pkey_index = 0;
+
+	attr.port_num = cm_id_->port_num;
 
 	std::cout << "qpn = " << ud_qp_->qp_num << ", pkey_index = " <<
-							 attr.pkey_index << ", port_num = " << attr.port_num << "\n";
+							 attr.pkey_index << ", port_num = " << +attr.port_num << "\n";
+
+	__be16 pkey;
+	if (ibv_query_pkey(pd_->context, attr.port_num, attr.pkey_index, &pkey)) {
+		std::cerr << "ibv_query_pkey failed: " << std::strerror(errno) << "\n";
+	}
 
 	// Queue Key (Q_Key): An Unreliable Datagram (UD) queue pair will get unicast
 	// or multicast messages from a remote UD QP only if the Q_key of the message
 	// is equal to the Q_key value of this UD QP. The remote peer that will send
 	// msg to this QP should specify the same Q_key as below.
-	attr.qkey = UDP_QKEY;
+	attr.qkey = UD_QKEY;
+	std::cout << "pkey = " << pkey << ", qkey = " << attr.qkey << "\n";
 
 	if (ibv_modify_qp(ud_qp_, &attr,
 				IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_QKEY)) {
 		std::cerr << "ibv_modify_qp failed to move QP to state INIT.\n";
+		std::cerr << "ibv_modify_qp failed: " << std::strerror(errno) << "\n";
 		return -3;
 	}
 
@@ -254,7 +276,8 @@ int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
 
 	std::cout << "Sending memory info: addr = " << server_info_msg.addr
 						<< ", len = " << server_info_msg.len
-						<< ", key = " << server_info_msg.key << "\n";
+						<< ", key = " << server_info_msg.key
+						<< ", qpn = " << server_info_msg.qpn << "\n";
 
 	struct ibv_sge sge;
 	sge.addr = reinterpret_cast<uint64_t>(&server_info_msg);
