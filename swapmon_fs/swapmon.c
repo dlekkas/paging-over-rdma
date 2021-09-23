@@ -329,10 +329,15 @@ static int swapmon_rdma_route_resolved(void) {
   return 0;
 }
 
+static int send_dummy_ud_msg(void) {
+	return 0;
+}
+
 static int init_ud_comms(void) {
 	struct ib_qp* ud_qp;
 	struct ib_qp_attr qp_attr;
 	struct ib_qp_init_attr qp_init_attr = {};
+	struct rdma_ah_attr ah_attr;
 	int ret;
 
 	qp_init_attr.send_cq = ctrl->cq;
@@ -352,7 +357,6 @@ static int init_ud_comms(void) {
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.qp_state   = IB_QPS_INIT;
 
-
 	ret = ib_find_pkey(ctrl->dev, ctrl->cm_id->port_num,
 				ctrl->server.ud_transport.pkey, &qp_attr.pkey_index);
 	if (ret) {
@@ -370,9 +374,59 @@ static int init_ud_comms(void) {
 		return ret;
 	}
 
-	pr_info("port_num = %u, qkey = %u, pkey_index = %u\n",
+	pr_info("[QP - INIT]port_num = %u, qkey = %u, pkey_index = %u\n",
 			qp_attr.port_num, qp_attr.qkey, qp_attr.pkey_index);
 
+	memset(&qp_attr, 0, sizeof(qp_attr));
+	qp_attr.qp_state = IB_QPS_RTR;
+	ret = ib_modify_qp(ud_qp, &qp_attr, IB_QP_STATE);
+	if (ret) {
+		pr_err("ib_modify_qp failed to move QP to state RTR.\n");
+		return ret;
+	}
+
+	memset(&qp_attr, 0, sizeof(qp_attr));
+	qp_attr.qp_state = IB_QPS_RTS;
+	// TODO(dimlek): check whether `sq_psn` should be set otherwise
+	qp_attr.sq_psn = 0;
+
+	ret = ib_modify_qp(ud_qp, &qp_attr, IB_QP_STATE | IB_QP_SQ_PSN);
+	if (ret) {
+		pr_err("ib_modify_qp failed to move QP to state RTS.\n");
+		return ret;
+	}
+	pr_info("UD QP is in RTS state.\n");
+
+	u16 sgid_index;
+	union ib_gid sgid = ctrl->cm_id->route.path_rec->sgid;
+	ret = ib_find_gid(ctrl->dev, &sgid, IB_GID_TYPE_IB, NULL,
+			&ctrl->cm_id->port_num, &sgid_index);
+	if (ret) {
+		pr_err("ib_find_gid failed.\n");
+		return ret;
+	}
+
+	memset(&ah_attr, 0, sizeof(ah_attr));
+	ah_attr.type = RDMA_AH_ATTR_TYPE_IB;
+
+	rdma_ah_set_grh(&ah_attr, &ctrl->server.ud_transport.gid,
+			0 /* flow_label */, sgid_index /* sgid_index */,
+			1 /* hop_limit */, 0 /* traffic_class */);
+	rdma_ah_set_sl(&ah_attr, 0);
+	rdma_ah_set_static_rate(&ah_attr, 0);
+	rdma_ah_set_port_num(&ah_attr, ctrl->cm_id->port_num);
+	rdma_ah_set_ah_flags(&ah_attr, IB_AH_GRH); // use global routing
+
+	rdma_ah_set_dlid(&ah_attr, ctrl->server.ud_transport.lid);
+	rdma_ah_set_path_bits(&ah_attr, 0);
+
+	ctrl->ah = rdma_create_ah(ctrl->pd, &ah_attr);
+	if (IS_ERR(ctrl->ah)) {
+		pr_err("rdma_create_ah failed.\n");
+		return PTR_ERR(ctrl->ah);
+	}
+
+	pr_info("address handle created succesfully.\n");
 	return 0;
 }
 
@@ -481,6 +535,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 				pr_err("unable to receive remote mem info.\n");
 			}
 			init_ud_comms();
+			send_dummy_ud_msg();
 
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);
