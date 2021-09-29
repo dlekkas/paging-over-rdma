@@ -52,6 +52,7 @@ struct swapmon_rdma_ctrl {
 	struct ib_pd *pd;
 	// queue pair (QP)
 	struct ib_qp *qp;
+	struct ib_qp *ud_qp;
 	// completion queue (CQ)
 	struct ib_cq *cq;
 
@@ -329,12 +330,60 @@ static int swapmon_rdma_route_resolved(void) {
   return 0;
 }
 
+#define UD_DUMMY_MSG "hello UD world!"
 static int send_dummy_ud_msg(void) {
+	struct ib_ud_wr ud_wr = {};
+	struct ib_send_wr *bad_wr;
+	struct ib_sge sg;
+	u64 dma_addr;
+
+	char* msg;
+	msg = kzalloc(sizeof(UD_DUMMY_MSG)+1, GFP_KERNEL);
+	if (!msg) {
+		pr_err("kzalloc failed to allocate mem for dummy UD msg.\n");
+		return -ENOMEM;
+	}
+
+	dma_addr = ib_dma_map_single(ctrl->dev, msg,
+			sizeof(UD_DUMMY_MSG)+1, DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+		pr_err("dma address mapping error.\n");
+	}
+
+	// Prepare DMA region to be accessed by device.
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			sizeof(UD_DUMMY_MSG)+1, DMA_TO_DEVICE);
+
+	sg.addr = dma_addr;
+	sg.length = sizeof(UD_DUMMY_MSG)+1;
+	sg.lkey = ctrl->pd->local_dma_lkey;
+
+	ud_wr.wr.next = NULL;
+	ud_wr.wr.wr_id = 1000;
+	ud_wr.wr.sg_list = &sg;
+	ud_wr.wr.num_sge = 1;
+	ud_wr.wr.opcode = IB_WR_SEND;
+	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
+
+
+	ud_wr.ah = ctrl->ah;
+	ud_wr.remote_qpn = ctrl->server.ud_transport.qpn;
+	ud_wr.remote_qkey = ctrl->server.ud_transport.qkey;
+
+	int ret;
+	/*
+	ret = ib_post_send(ctrl->ud_qp, &ud_wr.wr, &bad_wr);
+	if (ret) {
+		pr_err("ib_post_send failed to send dummy msg.\n");
+	}
+	*/
+
+	pr_info("send_dummy_ud_msg completed.\n");
 	return 0;
 }
 
+
 static int init_ud_comms(void) {
-	struct ib_qp* ud_qp;
 	struct ib_qp_attr qp_attr;
 	struct ib_qp_init_attr qp_init_attr = {};
 	struct rdma_ah_attr ah_attr;
@@ -348,10 +397,10 @@ static int init_ud_comms(void) {
 	qp_init_attr.cap.max_recv_sge = 0;
 	qp_init_attr.qp_type = IB_QPT_UD;
 
-	ud_qp = ib_create_qp(ctrl->pd, &qp_init_attr);
-	if (IS_ERR(ud_qp)) {
+	ctrl->ud_qp = ib_create_qp(ctrl->pd, &qp_init_attr);
+	if (IS_ERR(ctrl->ud_qp)) {
 		pr_err("ib_create_qp for UD communication failed.\n");
-		return PTR_ERR(ud_qp);
+		return PTR_ERR(ctrl->ud_qp);
 	}
 
 	memset(&qp_attr, 0, sizeof(qp_attr));
@@ -367,7 +416,7 @@ static int init_ud_comms(void) {
 	qp_attr.port_num = ctrl->cm_id->port_num;
 	qp_attr.qkey = ctrl->server.ud_transport.qkey;
 
-	ret = ib_modify_qp(ud_qp, &qp_attr,
+	ret = ib_modify_qp(ctrl->ud_qp, &qp_attr,
 			IB_QP_STATE | IB_QP_PKEY_INDEX | IB_QP_PORT | IB_QP_QKEY);
 	if (ret) {
 		pr_err("ib_modify_qp failed to move QP to state INIT.\n");
@@ -379,7 +428,7 @@ static int init_ud_comms(void) {
 
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.qp_state = IB_QPS_RTR;
-	ret = ib_modify_qp(ud_qp, &qp_attr, IB_QP_STATE);
+	ret = ib_modify_qp(ctrl->ud_qp, &qp_attr, IB_QP_STATE);
 	if (ret) {
 		pr_err("ib_modify_qp failed to move QP to state RTR.\n");
 		return ret;
@@ -390,7 +439,7 @@ static int init_ud_comms(void) {
 	// TODO(dimlek): check whether `sq_psn` should be set otherwise
 	qp_attr.sq_psn = 0;
 
-	ret = ib_modify_qp(ud_qp, &qp_attr, IB_QP_STATE | IB_QP_SQ_PSN);
+	ret = ib_modify_qp(ctrl->ud_qp, &qp_attr, IB_QP_STATE | IB_QP_SQ_PSN);
 	if (ret) {
 		pr_err("ib_modify_qp failed to move QP to state RTS.\n");
 		return ret;
