@@ -153,13 +153,28 @@ static struct ib_client swapmon_ib_client = {
 	.remove = swapmon_rdma_dev_remove
 };
 
-static char server_ip[INET_ADDRSTRLEN];
-static char client_ip[INET_ADDRSTRLEN];
-static int server_port;
+#define MAX_NR_SERVERS 3
 
+/*--------------------- Module parameters ---------------------*/
+
+static char *server[MAX_NR_SERVERS];
+static int nr_servers;
+module_param_array(server, charp, &nr_servers, 0644);
+MODULE_PARM_DESC(server, "IP addresses of memory servers in n.n.n.n form");
+
+static int server_port;
 module_param_named(sport, server_port, int, 0644);
-module_param_string(sip, server_ip, INET_ADDRSTRLEN, 0644);
+MODULE_PARM_DESC(server_port, "Port number that memory servers"
+		" are listening on");
+
+//static char server_ip[INET_ADDRSTRLEN];
+//module_param_string(sip, server_ip, INET_ADDRSTRLEN, 0644);
+
+static char client_ip[INET_ADDRSTRLEN];
 module_param_string(cip, client_ip, INET_ADDRSTRLEN, 0644);
+MODULE_PARM_DESC(client_ip, "IP address in n.n.n.n form of the interface used"
+		"for communicating with the memory servers");
+
 
 static int swapmon_rdma_parse_ipaddr(struct sockaddr_in *saddr, char *ip) {
 	int ret;
@@ -360,11 +375,10 @@ static int send_dummy_ud_msg(void) {
 
 	ud_wr.wr.next = NULL;
 	ud_wr.wr.wr_id = 1000;
-	ud_wr.wr.sg_list = &sg;
-	ud_wr.wr.num_sge = 1;
+	ud_wr.wr.sg_list = NULL;
+	ud_wr.wr.num_sge = 0;
 	ud_wr.wr.opcode = IB_WR_SEND;
 	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
-
 
 	ud_wr.ah = ctrl->ah;
 	ud_wr.remote_qpn = ctrl->server.ud_transport.qpn;
@@ -637,7 +651,14 @@ static int swapmon_rdma_wait_for_cm(void) {
 
 static int swapmon_rdma_create_ctrl(void) {
 	int ret;
+	int i;
+
 	printk("swapmon: swapmon_rdma_create_ctrl()\n");
+
+	if (nr_servers > MAX_NR_SERVERS) {
+		pr_err("Maximum number of supported memory servers: %d\n", MAX_NR_SERVERS);
+		return -1;
+	}
 
 	// once we have established a protection domain (PD), we may create objects
 	// within that domain. In a PD, we can register memory regions (MR), create
@@ -650,59 +671,61 @@ static int swapmon_rdma_create_ctrl(void) {
 	ctrl->qp_type = IB_QPT_RC;
 	ctrl->queue_size = 4;
 
-	ret = swapmon_rdma_parse_ipaddr(&(ctrl->server_addr), server_ip);
-	if (ret) {
-		printk("swapmon: swapmon_rdma_parse_ipaddr() for server ip failed\n");
-		return -EINVAL;
-	}
-	ctrl->server_addr.sin_port = cpu_to_be16(server_port);
-	ctrl->server_addr.sin_port = cpu_to_be16(10000);
+	for (i = 0; i < nr_servers; i++) {
+		ret = swapmon_rdma_parse_ipaddr(&(ctrl->server_addr), server[i]);
+		if (ret) {
+			printk("swapmon: swapmon_rdma_parse_ipaddr() for server ip failed\n");
+			return -EINVAL;
+		}
+		ctrl->server_addr.sin_port = cpu_to_be16(server_port);
+		ctrl->server_addr.sin_port = cpu_to_be16(10000);
 
-	ret = swapmon_rdma_parse_ipaddr(&(ctrl->client_addr), client_ip);
-	if (ret) {
-		printk("swapmon: swapmon_rdma_parse_ipaddr() for client ip failed\n");
-		return -EINVAL;
-	}
-	pr_info("src and dst addresses parsed successfully.\n");
+		ret = swapmon_rdma_parse_ipaddr(&(ctrl->client_addr), client_ip);
+		if (ret) {
+			printk("swapmon: swapmon_rdma_parse_ipaddr() for client ip failed\n");
+			return -EINVAL;
+		}
+		pr_info("src and dst addresses parsed successfully.\n");
 
-	init_completion(&ctrl->cm_done);
-	atomic_set(&ctrl->pending, 0);
-	spin_lock_init(&ctrl->cq_lock);
+		init_completion(&ctrl->cm_done);
+		atomic_set(&ctrl->pending, 0);
+		spin_lock_init(&ctrl->cq_lock);
 
-	pr_info("init_completion, atomic_set and spin_lock_init successful.\n");
+		pr_info("init_completion, atomic_set and spin_lock_init successful.\n");
 
-	// Each end of an RC service requires a Connection Manager (CM) to exchange
-	// Management Datagram (MAD) in order to create and associate QPs at the two
-	// ends. The `rdma_cm` identifier will report its event data (e.g. results of
-	// connecting) on the event channel and those events will be handled by the
-	// provided callback function `swapmon_rdma_cm_event_handler`.
-	ctrl->cm_id = rdma_create_id(&init_net, swapmon_rdma_cm_event_handler, ctrl,
-			RDMA_PS_TCP, ctrl->qp_type);
-	if (IS_ERR(ctrl->cm_id)) {
-		pr_err("RDMA CM ID creation failed\n");
-		return -ENODEV;
-	}
+		// Each end of an RC service requires a Connection Manager (CM) to exchange
+		// Management Datagram (MAD) in order to create and associate QPs at the two
+		// ends. The `rdma_cm` identifier will report its event data (e.g. results of
+		// connecting) on the event channel and those events will be handled by the
+		// provided callback function `swapmon_rdma_cm_event_handler`.
+		ctrl->cm_id = rdma_create_id(&init_net, swapmon_rdma_cm_event_handler, ctrl,
+				RDMA_PS_TCP, ctrl->qp_type);
+		if (IS_ERR(ctrl->cm_id)) {
+			pr_err("RDMA CM ID creation failed\n");
+			return -ENODEV;
+		}
 
-	pr_info("rdma_create_id completed successfully.\n");
+		pr_info("rdma_create_id completed successfully.\n");
 
-	// Resolve destination and optionally source addresses from IP addresses to an
-	// RDMA address and if the resolution is successful, then the RDMA cm id will
-	// be bound to an RDMA device.
-	ret = rdma_resolve_addr(ctrl->cm_id, (struct sockaddr *)&ctrl->client_addr,
-			(struct sockaddr *)&ctrl->server_addr, SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
-	if (ret) {
-		pr_err("rdma_resolve_addr failed: %d\n", ret);
-		goto out_destroy_cm_id;
-	}
+		// Resolve destination and optionally source addresses from IP addresses to an
+		// RDMA address and if the resolution is successful, then the RDMA cm id will
+		// be bound to an RDMA device.
+		ret = rdma_resolve_addr(ctrl->cm_id, (struct sockaddr *)&ctrl->client_addr,
+				(struct sockaddr *)&ctrl->server_addr, SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+		if (ret) {
+			pr_err("rdma_resolve_addr failed: %d\n", ret);
+			goto out_destroy_cm_id;
+		}
 
-	pr_info("rdma_resolve_addr completed successfully.\n");
-	// TODO(dimlek): remove this ret statement when everything is ok.
-	// return 0;
+		pr_info("rdma_resolve_addr completed successfully.\n");
+		// TODO(dimlek): remove this ret statement when everything is ok.
+		// return 0;
 
-	ret = swapmon_rdma_wait_for_cm();
-	if (ret) {
-		pr_err("swapmon_rdma_wait_for_cm failed\n");
-		goto out_destroy_cm_id;
+		ret = swapmon_rdma_wait_for_cm();
+		if (ret) {
+			pr_err("swapmon_rdma_wait_for_cm failed\n");
+			goto out_destroy_cm_id;
+		}
 	}
 
 	return 0;
@@ -758,4 +781,6 @@ static void __exit swapmonfs_exit(void) {
 module_init(swapmonfs_init);
 module_exit(swapmonfs_exit);
 
+MODULE_AUTHOR("Dimitris Lekkas, dlekkasp@gmail.com");
+MODULE_DESCRIPTION("Low latency and memory efficient paging over RDMA");
 MODULE_LICENSE("GPL v2");
