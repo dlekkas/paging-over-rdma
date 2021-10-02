@@ -66,6 +66,7 @@ struct swapmon_rdma_ctrl {
 
 	// RDMA identifier created through `rdma_create_id`
 	struct rdma_cm_id *cm_id;
+	struct rdma_cm_id *mcast_cm_id;
 
 	struct completion cm_done;
 	atomic_t pending;
@@ -78,6 +79,7 @@ struct swapmon_rdma_ctrl {
 
 	struct sockaddr_in server_addr;
 	struct sockaddr_in client_addr;
+	struct sockaddr_in mcast_addr;
 };
 
 struct swapmon_transport_ops {
@@ -345,6 +347,55 @@ static int swapmon_rdma_route_resolved(void) {
   return 0;
 }
 
+// TODO(dimlek): generates a unique Multicast address which will be transferred
+static int mcast_logic(void) {
+	int ret;
+
+	pr_info("mcast_logic()\n");
+	if (rdma_cap_ib_mcast(ctrl->dev, ctrl->cm_id->port_num)) {
+		// TODO(dimlek): here we must implement the logic which registers the HCA
+		// with the Subnet Manager (SM) to join the multicast group.
+		pr_info("[MCAST]: rdma_cap_ib_mcast returned true.\n");
+	}
+	pr_info("mcast_logic checkpoint\n");
+
+	ret = swapmon_rdma_parse_ipaddr(&(ctrl->mcast_addr), "0.0.0.0");
+	if (ret) {
+		printk("swapmon_rdma_parse_ipaddr() for multicast ip failed\n");
+		return -EINVAL;
+	}
+	pr_info("[MCAST]: multicast address parsed successfully.\n");
+
+	ctrl->mcast_cm_id = rdma_create_id(&init_net, swapmon_rdma_cm_event_handler,
+			ctrl, RDMA_PS_UDP, IB_QPT_UD);
+	if (IS_ERR(ctrl->mcast_cm_id)) {
+		pr_err("[MCAST]: CM ID creation failed\n");
+		return -ENODEV;
+	}
+	pr_info("[MCAST]: rdma_create_id completed successfully.\n");
+
+	ret = rdma_bind_addr(ctrl->mcast_cm_id,
+			(struct sockaddr *)&ctrl->client_addr);
+	if (ret) {
+		pr_err("[MCAST]: rdma_bind_addr failed: %d\n", ret);
+		return ret;
+	}
+
+	// Resolve destination and optionally source addresses from IP addresses to an
+	// RDMA address and if the resolution is successful, then the RDMA cm id will
+	// be bound to an RDMA device.
+	ret = rdma_resolve_addr(ctrl->mcast_cm_id,
+			(struct sockaddr *) &ctrl->client_addr,
+			(struct sockaddr *) &ctrl->mcast_addr,
+			SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+	if (ret) {
+		pr_err("[MCAST]: rdma_resolve_addr failed: %d\n", ret);
+	}
+
+	pr_info("[MCAST]: rdma_resolve_addr completed successfully.\n");
+	return 0;
+}
+
 #define UD_DUMMY_MSG "hello UD world!"
 static int send_dummy_ud_msg(void) {
 	struct ib_ud_wr ud_wr = {};
@@ -571,6 +622,21 @@ static int recv_mem_info(struct ib_qp *qp) {
 	return 0;
 }
 
+static int mcast_join_handler(struct rdma_ud_param *param) {
+	if (param->ah_attr.type != RDMA_AH_ATTR_TYPE_IB) {
+		pr_err("Only IB AH type is currently supported.\n");
+		return -1;
+	}
+
+	pr_info("UD Multicast membership info: dgid = %16phC, mlid = 0x%x, "
+			"sl = %d, src_path_bits = %u, qpn = %u, qkey = %u\n",
+			param->ah_attr.grh.dgid.raw, param->ah_attr.ib.dlid,
+			rdma_ah_get_sl(&param->ah_attr), rdma_ah_get_path_bits(&param->ah_attr),
+			param->qp_num, param->qkey);
+
+	return 0;
+}
+
 // For connection establishment, a sample sequence consists of a Request (REQ)
 // from the client to the server, a Reply (REP) from the server to the client
 // (to indicate that the request was accepted), and a Ready To Use (RTU) from
@@ -599,6 +665,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			}
 			init_ud_comms();
 			send_dummy_ud_msg();
+			//mcast_logic();
 
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);
@@ -620,11 +687,16 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			pr_info("Connection request or response rejected by remote endpoint.\n");
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
+			pr_info("RDMA connection was closed.\n");
+			break;
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
+			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
+			cm_error = mcast_join_handler(&event->param.ud);
 			pr_info("multicast join operation completed successfully.\n");
 			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
+			break;
 		case RDMA_CM_EVENT_ADDR_CHANGE:
 		case RDMA_CM_EVENT_TIMEWAIT_EXIT:
 			break;
