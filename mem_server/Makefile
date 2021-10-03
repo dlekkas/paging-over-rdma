@@ -1,11 +1,22 @@
+TARGET = server
+
+# ignore hidden files/directories (messes up with .ccls_cache)
+SRCS = $(shell find ./src -not -path '*/\.*' -type f -name *.cc)
+OBJS = $(SRCS:.cc=.o)
+
+CXXFLAGS = -O3 -Wall -std=c++17
+LDFLAGS = -lrdmacm -libverbs -lpthread
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CXX) -o $@ $(OBJS) ${LDFLAGS}
+
+run: all
+	@./$(TARGET)
+
+
 .PHONY: clean
 
-LDLIBS := ${LDLIBS} -lrdmacm -libverbs -lpthread
-CC := g++
-
-SERVER := server
-
-all: ${SERVER}
-
 clean:
-	rm -f ${SERVER}
+	rm -f $(OBJS) $(TARGET)
