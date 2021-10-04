@@ -9,6 +9,7 @@
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
 #include <rdma/ib_mad.h>
+#include <rdma/ib.h>
 
 #include <linux/init.h>
 
@@ -48,13 +49,19 @@ struct server_info {
 struct swapmon_rdma_ctrl {
 	struct ib_device *dev;
 
-	// protection domain (PD)
+	// TODO(dimlek): maybe use the same PD for both (?)
 	struct ib_pd *pd;
+	struct ib_pd *mcast_pd;
+
+
 	// queue pair (QP)
 	struct ib_qp *qp;
 	struct ib_qp *ud_qp;
+	struct ib_qp *mcast_qp;
+
 	// completion queue (CQ)
 	struct ib_cq *cq;
+	struct ib_cq *mcast_cq;
 
 	struct server_info server;
 
@@ -77,9 +84,12 @@ struct swapmon_rdma_ctrl {
 	// RDMA connection state
 	enum rdma_cm_event_type state;
 
+	// IPv4 addresses
 	struct sockaddr_in server_addr;
 	struct sockaddr_in client_addr;
-	struct sockaddr_in mcast_addr;
+
+	// Infiniband address
+	struct sockaddr_ib mcast_addr;
 };
 
 struct swapmon_transport_ops {
@@ -347,22 +357,41 @@ static int swapmon_rdma_route_resolved(void) {
   return 0;
 }
 
+static int str_to_ib_sockaddr(char *dst, struct sockaddr_ib *mcast_addr) {
+	int ret;
+	size_t len = strlen(dst);
+
+	pr_info("start: %s\n", __FUNCTION__);
+	if (len > INET6_ADDRSTRLEN) {
+		return -EINVAL;
+	}
+
+	ret = in6_pton(dst, len, mcast_addr->sib_addr.sib_raw, '\0', NULL);
+	if (ret <= 0) {
+		pr_err("[MCAST]: in6_pton() failed with ret = %d\n", ret);
+		return ret;
+	}
+	mcast_addr->sib_family = AF_IB;
+
+	return 0;
+}
+
 // TODO(dimlek): generates a unique Multicast address which will be transferred
 static int mcast_logic(void) {
+	struct ib_qp_init_attr init_attr;
 	int ret;
 
-	pr_info("mcast_logic()\n");
+	pr_info("[MCAST]: mcast_logic()\n");
 	if (rdma_cap_ib_mcast(ctrl->dev, ctrl->cm_id->port_num)) {
 		// TODO(dimlek): here we must implement the logic which registers the HCA
 		// with the Subnet Manager (SM) to join the multicast group.
 		pr_info("[MCAST]: rdma_cap_ib_mcast returned true.\n");
 	}
-	pr_info("mcast_logic checkpoint\n");
 
-	ret = swapmon_rdma_parse_ipaddr(&(ctrl->mcast_addr), "0.0.0.0");
+	ret = str_to_ib_sockaddr("::", &ctrl->mcast_addr);
 	if (ret) {
-		printk("swapmon_rdma_parse_ipaddr() for multicast ip failed\n");
-		return -EINVAL;
+		pr_err("parse_ib_maddr() failed\n");
+		return ret;
 	}
 	pr_info("[MCAST]: multicast address parsed successfully.\n");
 
@@ -375,12 +404,47 @@ static int mcast_logic(void) {
 	pr_info("[MCAST]: rdma_create_id completed successfully.\n");
 
 	ret = rdma_bind_addr(ctrl->mcast_cm_id,
-			(struct sockaddr *)&ctrl->client_addr);
+			(struct sockaddr *) &ctrl->client_addr);
 	if (ret) {
 		pr_err("[MCAST]: rdma_bind_addr failed: %d\n", ret);
 		return ret;
 	}
 
+	ctrl->mcast_pd = ib_alloc_pd(ctrl->dev, 0);
+	if (IS_ERR(ctrl->mcast_pd)) {
+		pr_err("ib_alloc_pd failed.\n");
+		return PTR_ERR(ctrl->mcast_pd);
+	}
+
+	ctrl->mcast_cq = ib_alloc_cq(ctrl->dev, ctrl, 4096, 0, IB_POLL_SOFTIRQ);
+	if (IS_ERR(ctrl->mcast_cq)) {
+		ret = PTR_ERR(ctrl->mcast_cq);
+	}
+	pr_info("[MCAST]: ib_alloc_cq completed successfully.\n");
+
+	// TODO(dimlek): set max_send/recv properly
+	memset(&init_attr, 0, sizeof(init_attr));
+	init_attr.event_handler = swapmon_rdma_qp_event;
+	init_attr.cap.max_send_wr = 20;
+	init_attr.cap.max_recv_wr = 20;
+	init_attr.cap.max_recv_sge = 1;
+	init_attr.cap.max_send_sge = 1;
+	init_attr.sq_sig_type = IB_SIGNAL_ALL_WR;
+	init_attr.qp_type = IB_QPT_UD;
+	init_attr.send_cq = ctrl->mcast_cq;
+	init_attr.recv_cq = ctrl->mcast_cq;
+
+	// allocate a queue pair (QP) and associate it with the specified
+	// RDMA identifier cm_id
+	ret = rdma_create_qp(ctrl->mcast_cm_id, ctrl->mcast_pd, &init_attr);
+	if (ret) {
+		pr_err("rdma_create_qp failed.\n");
+		return -1;
+	}
+	ctrl->mcast_qp = ctrl->mcast_cm_id->qp;
+
+
+	/*
 	// Resolve destination and optionally source addresses from IP addresses to an
 	// RDMA address and if the resolution is successful, then the RDMA cm id will
 	// be bound to an RDMA device.
@@ -393,6 +457,7 @@ static int mcast_logic(void) {
 	}
 
 	pr_info("[MCAST]: rdma_resolve_addr completed successfully.\n");
+	*/
 	return 0;
 }
 
@@ -665,7 +730,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			}
 			init_ud_comms();
 			send_dummy_ud_msg();
-			//mcast_logic();
+			mcast_logic();
 
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);
@@ -704,6 +769,8 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			pr_err("received unrecognized RDMA CM event %d\n", event->event);
 			break;
 	}
+
+	pr_info("cm_error=%d\n", cm_error);
 
 	if (cm_error) {
 		ctrl->cm_error = cm_error;
@@ -776,7 +843,6 @@ static int swapmon_rdma_create_ctrl(void) {
 			pr_err("RDMA CM ID creation failed\n");
 			return -ENODEV;
 		}
-
 		pr_info("rdma_create_id completed successfully.\n");
 
 		// Resolve destination and optionally source addresses from IP addresses to an
@@ -790,8 +856,6 @@ static int swapmon_rdma_create_ctrl(void) {
 		}
 
 		pr_info("rdma_resolve_addr completed successfully.\n");
-		// TODO(dimlek): remove this ret statement when everything is ok.
-		// return 0;
 
 		ret = swapmon_rdma_wait_for_cm();
 		if (ret) {
