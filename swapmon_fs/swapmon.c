@@ -415,6 +415,7 @@ static int mcast_logic(void) {
 		pr_err("ib_alloc_pd failed.\n");
 		return PTR_ERR(ctrl->mcast_pd);
 	}
+	pr_info("[MCAST]: ib_alloc_pd completed successfully.\n");
 
 	ctrl->mcast_cq = ib_alloc_cq(ctrl->dev, ctrl, 4096, 0, IB_POLL_SOFTIRQ);
 	if (IS_ERR(ctrl->mcast_cq)) {
@@ -442,22 +443,16 @@ static int mcast_logic(void) {
 		return -1;
 	}
 	ctrl->mcast_qp = ctrl->mcast_cm_id->qp;
+	pr_info("[MCAST]: rdma_create_qp completed succesfully.\n");
 
-
-	/*
-	// Resolve destination and optionally source addresses from IP addresses to an
-	// RDMA address and if the resolution is successful, then the RDMA cm id will
-	// be bound to an RDMA device.
-	ret = rdma_resolve_addr(ctrl->mcast_cm_id,
-			(struct sockaddr *) &ctrl->client_addr,
-			(struct sockaddr *) &ctrl->mcast_addr,
-			SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+	ret = rdma_join_multicast(ctrl->mcast_cm_id,
+			(struct sockaddr *) &ctrl->mcast_addr, BIT(FULLMEMBER_JOIN), ctrl);
 	if (ret) {
-		pr_err("[MCAST]: rdma_resolve_addr failed: %d\n", ret);
+		pr_err("rdma_join_multicast failed.\n");
+		return -2;
 	}
+	pr_info("[MCAST]: rdma_join_multicast completed succesfully.\n");
 
-	pr_info("[MCAST]: rdma_resolve_addr completed successfully.\n");
-	*/
 	return 0;
 }
 
