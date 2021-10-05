@@ -604,6 +604,64 @@ static int init_ud_comms(void) {
 	return 0;
 }
 
+static int send_mcast_grp_info(struct ib_qp *qp, struct rdma_ud_param *param) {
+	struct ib_send_wr *bad_wr;
+	struct ib_send_wr wr;
+	struct ib_sge sge;
+	struct ib_wc wc;
+	int ret;
+
+	struct mcast_grp_info {
+		u8 gid_raw[16];
+		u16 lid;
+		u32 qkey;
+	};
+
+	struct mcast_grp_info *msg;
+	msg = kzalloc(sizeof(struct mcast_grp_info), GFP_KERNEL);
+	if (!msg) {
+		pr_err("kzalloc failed to allocate mem for struct mcast_grp_info.\n");
+		return -ENOMEM;
+	}
+
+	pr_info("send_mcast_grp_info() init.\n");
+
+	memcpy(msg->gid_raw, param->ah_attr.grh.dgid.raw, 16);
+	msg->lid = param->ah_attr.ib.dlid;
+	msg->qkey = param->qkey;
+
+	sge.addr = (u64) msg;
+	sge.length = sizeof(struct mcast_grp_info);
+	sge.lkey = ctrl->pd->local_dma_lkey;
+
+	wr.next = NULL;
+	wr.wr_id = 200;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED | IB_SEND_INLINE;
+
+	ret = ib_post_send(ctrl->qp, &wr, &bad_wr);
+	if (unlikely(ret)) {
+		pr_err("ib_post_send() failed with code = %d\n.", ret);
+		return ret;
+	}
+
+	/*
+	while (!ib_poll_cq(ctrl->qp->send_cq, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IB_WC_SUCCESS) {
+		printk("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc.status), wc.wr_id);
+		return wc.status;
+	}
+	*/
+
+	return 0;
+}
+
 static int recv_mem_info(struct ib_qp *qp) {
 	struct ib_recv_wr *bad_wr;
 	struct ib_recv_wr wr;
@@ -694,6 +752,8 @@ static int mcast_join_handler(struct rdma_ud_param *param) {
 			rdma_ah_get_sl(&param->ah_attr), rdma_ah_get_path_bits(&param->ah_attr),
 			param->qp_num, param->qkey);
 
+	send_mcast_grp_info(ctrl->qp, param);
+
 	return 0;
 }
 
@@ -723,12 +783,9 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			if (ret) {
 				pr_err("unable to receive remote mem info.\n");
 			}
-			init_ud_comms();
-			send_dummy_ud_msg();
+			//init_ud_comms();
+			//send_dummy_ud_msg();
 			mcast_logic();
-
-			ctrl->cm_error = 0;
-			complete(&ctrl->cm_done);
 			break;
 		case RDMA_CM_EVENT_ROUTE_ERROR:
 		case RDMA_CM_EVENT_ADDR_ERROR:
@@ -754,6 +811,8 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
 			cm_error = mcast_join_handler(&event->param.ud);
 			pr_info("multicast join operation completed successfully.\n");
+			ctrl->cm_error = 0;
+			complete(&ctrl->cm_done);
 			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
 			break;

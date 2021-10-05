@@ -78,6 +78,8 @@ class ServerRDMA {
 	// client about the memory address, length and lkey.
 	int send_mem_info(struct ibv_qp *qp);
 
+	int recv_mcast_grp_info(struct ibv_qp *qp);
+
 	int extract_pkey_index(uint8_t port_num, __be16 pkey);
 
 	// Event channel used to report communication events.
@@ -103,6 +105,12 @@ class ServerRDMA {
 
 	// Number of accepted connections.
 	int n_conns_;
+
+	struct mcast_grp_info {
+		uint8_t gid_raw[16];
+		uint16_t lid;
+		uint32_t qkey;
+	} mcast_info_msg;
 };
 
 int ServerRDMA::extract_pkey_index(uint8_t port_num, __be16 pkey) {
@@ -256,6 +264,29 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	return 0;
 }
 
+int ServerRDMA::recv_mcast_grp_info(struct ibv_qp *qp) {
+	struct ibv_sge sg;
+	struct ibv_recv_wr wr;
+	struct ibv_recv_wr *bad_wr;
+
+
+	sg.addr = reinterpret_cast<uint64_t>(&mcast_info_msg);
+	sg.length = sizeof(mcast_info_msg);
+	sg.lkey = mr_->lkey;
+
+	wr.wr_id = 200;
+	wr.next = NULL;
+	wr.sg_list = &sg;
+	wr.num_sge = 1;
+
+	if (ibv_post_recv(qp, &wr, &bad_wr)) {
+		std::cerr << "ibv_post_recv() failed.\n";
+		return -1;
+	}
+
+	return 0;
+}
+
 int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
 
 	std::cout << "Invoking InitUDP()\n";
@@ -309,6 +340,10 @@ int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
 		return -1;
 	}
 
+	std::cout << "gid = " << mcast_info_msg.gid_raw << "\n";
+	std::cout << "lid = " << mcast_info_msg.lid << "\n";
+	std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
+
 	return 0;
 }
 
@@ -322,6 +357,11 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			on_connect_request(ev_cm_id, &ev->param.conn);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
+			if (recv_mcast_grp_info(ev_cm_id->qp)) {
+				std::cout << "Failed to receive multicast group info.\n";
+			} else {
+				std::cout << "Multicast group info received successfully.\n";
+			}
 			// Upon receiving a message that connection is established, we can
 			// acknowledge the event back to the client. The call below also frees
 			// the event structure and any memory it references.
@@ -331,6 +371,18 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			} else {
 				std::cout << "Memory region info sent successfully.\n";
 			}
+
+			struct ibv_wc wc;
+			while (!ibv_poll_cq(ev_cm_id->qp->recv_cq, 1, &wc)) {
+				// nothing
+			}
+
+			if (wc.status != IBV_WC_SUCCESS) {
+				std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
+									<< ", work request ID: " << wc.wr_id << std::endl;
+				return -1;
+			}
+
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			n_conns_++;
 			break;
@@ -515,6 +567,7 @@ int main(int argc, char *argv[]) {
 
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
+	while (true) {}
 
 	return 0;
 }
