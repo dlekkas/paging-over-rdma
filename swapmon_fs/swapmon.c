@@ -616,8 +616,24 @@ static int send_mcast_grp_info(struct ib_qp *qp, struct rdma_ud_param *param) {
 		u16 lid;
 		u32 qkey;
 	};
-
 	struct mcast_grp_info *msg;
+
+	u64 dma_addr;
+	/*
+	ib_dma_alloc_coherent(ctrl->dev, sizeof(struct mcast_grp_info),
+			&dma_addr, GFP_KERNEL);
+
+	memcpy(((struct mcast_grp_info *) dma_addr)->gid_raw,
+			param->ah_attr.grh.dgid.raw, 16);
+	((struct mcast_grp_info *) dma_addr)->lid  = param->ah_attr.ib.dlid;
+	((struct mcast_grp_info *) dma_addr)->qkey = param->qkey;
+
+
+	// Prepare DMA region to be accessed by device.
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			sizeof(struct mcast_grp_info), DMA_TO_DEVICE);
+	*/
+
 	msg = kzalloc(sizeof(struct mcast_grp_info), GFP_KERNEL);
 	if (!msg) {
 		pr_err("kzalloc failed to allocate mem for struct mcast_grp_info.\n");
@@ -630,7 +646,17 @@ static int send_mcast_grp_info(struct ib_qp *qp, struct rdma_ud_param *param) {
 	msg->lid = param->ah_attr.ib.dlid;
 	msg->qkey = param->qkey;
 
-	sge.addr = (u64) msg;
+	dma_addr = ib_dma_map_single(ctrl->dev, msg,
+			sizeof(struct mcast_grp_info), DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+		pr_err("dma address mapping error.\n");
+	}
+
+	// Prepare DMA region to be accessed by device.
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			sizeof(struct mcast_grp_info), DMA_BIDIRECTIONAL);
+
+	sge.addr = dma_addr;
 	sge.length = sizeof(struct mcast_grp_info);
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
@@ -639,16 +665,17 @@ static int send_mcast_grp_info(struct ib_qp *qp, struct rdma_ud_param *param) {
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 	wr.opcode = IB_WR_SEND;
-	wr.send_flags = IB_SEND_SIGNALED | IB_SEND_INLINE;
+	wr.send_flags = IB_SEND_SIGNALED;
 
-	ret = ib_post_send(ctrl->qp, &wr, &bad_wr);
-	if (unlikely(ret)) {
+	pr_info("ib_post_send() init.\n");
+	ret = ib_post_send(qp, &wr, &bad_wr);
+	if (ret) {
 		pr_err("ib_post_send() failed with code = %d\n.", ret);
 		return ret;
 	}
+	pr_info("ib_post_send() completed.\n");
 
-	/*
-	while (!ib_poll_cq(ctrl->qp->send_cq, 1, &wc)) {
+	while (!ib_poll_cq(qp->send_cq, 1, &wc)) {
 		// nothing
 	}
 
@@ -657,7 +684,7 @@ static int send_mcast_grp_info(struct ib_qp *qp, struct rdma_ud_param *param) {
 					 ib_wc_status_msg(wc.status), wc.wr_id);
 		return wc.status;
 	}
-	*/
+	pr_info("wc succeeded wr_id = %llu", wc.wr_id);
 
 	return 0;
 }
@@ -753,6 +780,8 @@ static int mcast_join_handler(struct rdma_ud_param *param) {
 			param->qp_num, param->qkey);
 
 	send_mcast_grp_info(ctrl->qp, param);
+
+	pr_info("mcast_join_handler done.\n");
 
 	return 0;
 }

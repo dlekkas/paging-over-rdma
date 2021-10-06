@@ -10,6 +10,8 @@
 #include <vector>
 #include <iostream>
 #include <cerrno>
+#include <chrono>
+#include <thread>
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
 #define UD_QKEY 0x11111111
@@ -269,10 +271,16 @@ int ServerRDMA::recv_mcast_grp_info(struct ibv_qp *qp) {
 	struct ibv_recv_wr wr;
 	struct ibv_recv_wr *bad_wr;
 
+	struct ibv_mr *recv_mr;
+	recv_mr = ibv_reg_mr(pd_, &mcast_info_msg, sizeof(mcast_info_msg),
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+	if (recv_mr == nullptr) {
+		std::cerr << "ibv_reg_mr failed.\n";
+	}
 
 	sg.addr = reinterpret_cast<uint64_t>(&mcast_info_msg);
 	sg.length = sizeof(mcast_info_msg);
-	sg.lkey = mr_->lkey;
+	sg.lkey = recv_mr->lkey;
 
 	wr.wr_id = 200;
 	wr.next = NULL;
@@ -340,10 +348,6 @@ int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
 		return -1;
 	}
 
-	std::cout << "gid = " << mcast_info_msg.gid_raw << "\n";
-	std::cout << "lid = " << mcast_info_msg.lid << "\n";
-	std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
-
 	return 0;
 }
 
@@ -357,15 +361,15 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			on_connect_request(ev_cm_id, &ev->param.conn);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
-			if (recv_mcast_grp_info(ev_cm_id->qp)) {
-				std::cout << "Failed to receive multicast group info.\n";
-			} else {
-				std::cout << "Multicast group info received successfully.\n";
-			}
 			// Upon receiving a message that connection is established, we can
 			// acknowledge the event back to the client. The call below also frees
 			// the event structure and any memory it references.
 			std::cout << "Connection established.\n";
+
+			if (recv_mcast_grp_info(ev_cm_id->qp)) {
+				std::cout << "Failed to post RR for multicast group info.\n";
+			}
+
 			if (send_mem_info(ev_cm_id->qp)) {
 				std::cout << "Failed to exchange memory region info.\n";
 			} else {
@@ -382,6 +386,12 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 									<< ", work request ID: " << wc.wr_id << std::endl;
 				return -1;
 			}
+
+			std::cout << "Received message with wr_id = " << wc.wr_id << "\n";
+			std::cout << "gid = " << mcast_info_msg.gid_raw << "\n";
+			std::cout << "lid = " << mcast_info_msg.lid << "\n";
+			std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
+
 
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			n_conns_++;
@@ -567,7 +577,10 @@ int main(int argc, char *argv[]) {
 
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
-	while (true) {}
+
+	std::cout << "Pausing for 30sec." << std::endl;
+	std::chrono::milliseconds pause_tm(30000);
+	std::this_thread::sleep_for(pause_tm);
 
 	return 0;
 }
