@@ -1,3 +1,9 @@
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netdb.h>
+
+
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <infiniband/verbs.h>
@@ -82,6 +88,10 @@ class ServerRDMA {
 
 	int recv_mcast_grp_info(struct ibv_qp *qp);
 
+	void join_mcast_group();
+
+	void init_mcast_rdma_resources();
+
 	int extract_pkey_index(uint8_t port_num, __be16 pkey);
 
 	// Event channel used to report communication events.
@@ -90,7 +100,11 @@ class ServerRDMA {
 	// Communication Manager ID used to track connection communication info.
 	struct rdma_cm_id *cm_id_;
 
+	struct rdma_cm_id *mcast_cm_id_;
+
 	struct ibv_cq *cq_;
+
+	struct ibv_cq *mcast_cq_;
 
 	struct ibv_srq *srq_;
 
@@ -99,6 +113,10 @@ class ServerRDMA {
 	struct ibv_pd *pd_;
 
 	struct ibv_qp *ud_qp_;
+
+	struct ibv_qp *mcast_qp_;
+
+	struct sockaddr src_addr_;
 
 	void *buf_;
 
@@ -392,9 +410,9 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			std::cout << "lid = " << mcast_info_msg.lid << "\n";
 			std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
 
+			join_mcast_group();
 
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
-			n_conns_++;
 			break;
 		case RDMA_CM_EVENT_ADDR_RESOLVED:
 		case RDMA_CM_EVENT_ADDR_ERROR:
@@ -406,7 +424,11 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 		case RDMA_CM_EVENT_REJECTED:
 		case RDMA_CM_EVENT_DISCONNECTED:
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
+			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
+			std::cout << "Joined multicast group successfully.\n";
+			n_conns_++;
+			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
 		case RDMA_CM_EVENT_ADDR_CHANGE:
 		case RDMA_CM_EVENT_TIMEWAIT_EXIT:
@@ -415,6 +437,119 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			break;
 	}
 	return 0;
+}
+
+void ServerRDMA::init_mcast_rdma_resources() {
+	/*
+	if (rdma_create_id(ev_channel_, &mcast_cm_id_, NULL, RDMA_PS_UDP)) {
+		std::cerr << "rdma_create_id() failed: " << std::strerror(errno) << "\n";
+		return;
+	}
+	*/
+
+	if (!pd_) {
+		std::cerr << "Protection domain not initialized.\n";
+		return;
+	}
+
+	mcast_cq_ = ibv_create_cq(pd_->context, MIN_CQE, NULL, NULL, 0);
+	if (!cq_) {
+		std::cerr << "ibv_create_cq failed: " << std::strerror(errno) << "\n";
+		return;
+		// std::exit(EXIT_FAILURE);
+	}
+
+	/*
+	std::string ip("192.168.1.20");
+	struct rdma_addrinfo hints;
+	hints.ai_port_space = RDMA_PS_UDP;
+	hints.ai_flags = RAI_PASSIVE;
+
+	struct rdma_addrinfo *res;
+	std::cout << "getaddrinfo()\n";
+	if (rdma_getaddrinfo(ip.c_str(), NULL, &hints, &res)) {
+		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
+	}
+	*/
+
+	struct sockaddr_in sa;
+	inet_pton(AF_INET, "192.168.1.20", &(sa.sin_addr));
+
+	/*
+	std::cout << "bindaddr()\n";
+	if (rdma_bind_addr(mcast_cm_id_, (struct sockaddr *) &sa)) {
+		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
+	}
+	std::cout << "done\n";
+	*/
+
+	struct ibv_qp_init_attr attr;
+	std::memset(&attr, 0, sizeof(attr));
+	attr.send_cq = mcast_cq_;
+	attr.recv_cq = mcast_cq_;
+	attr.srq = NULL;
+	attr.cap.max_send_wr = 6;
+	attr.cap.max_recv_wr = 6;
+	attr.cap.max_send_sge = 1;
+	attr.cap.max_recv_sge = 1;
+	attr.cap.max_inline_data = 16;
+	attr.qp_type = IBV_QPT_UD;
+	attr.sq_sig_all = 0;
+	if (rdma_create_qp(mcast_cm_id_, pd_, &attr)) {
+		std::cerr << "[2]rdma_create_qp() failed: " << std::strerror(errno) << "\n";
+	}
+}
+
+void ServerRDMA::join_mcast_group() {
+	init_mcast_rdma_resources();
+
+	std::cout << "init_mcast_rdma_resources() finished successfully.\n";
+
+	char addr_buf[INET6_ADDRSTRLEN];
+	if (!inet_ntop(AF_INET6, mcast_info_msg.gid_raw,
+				addr_buf, INET6_ADDRSTRLEN)) {
+		std::cerr << "inet_ntop failed to convert multicast address.\n";
+	}
+
+	std::string mcast_addr_str(addr_buf);
+	std::cout << "mcast grp addr = " << mcast_addr_str << "\n";
+
+	struct rdma_addrinfo hints;
+	std::memset(&hints, 0, sizeof(hints));
+	hints.ai_port_space = RDMA_PS_UDP;
+	hints.ai_flags = 0;
+
+	struct rdma_addrinfo *addrinfo;
+	if (rdma_getaddrinfo(mcast_addr_str.c_str(), NULL, &hints, &addrinfo)) {
+		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
+	}
+
+	/*
+	std::string ip("192.168.1.20");
+
+	struct rdma_addrinfo *res;
+	if (rdma_getaddrinfo(ip.c_str(), NULL, NULL, &res)) {
+		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
+		std::exit(EXIT_FAILURE);
+	}
+	*/
+
+	/*
+	if (rdma_bind_addr(mcast_cm_id_, res->ai_src_addr)) {
+		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
+	}
+	*/
+
+	struct rdma_cm_join_mc_attr_ex mc_join_attr;
+	mc_join_attr.comp_mask = RDMA_CM_JOIN_MC_ATTR_ADDRESS |
+													 RDMA_CM_JOIN_MC_ATTR_JOIN_FLAGS;
+	mc_join_attr.addr = addrinfo->ai_dst_addr;
+	mc_join_attr.join_flags = RDMA_MC_JOIN_FLAG_FULLMEMBER;
+	if (rdma_join_multicast_ex(mcast_cm_id_, &mc_join_attr, NULL)) {
+		std::cerr << "rdma_join_multicast_ex() failed: "
+			<< std::strerror(errno) << "\n";
+	}
+	std::cout << "rdma_join_multicast_ex.\n";
 }
 
 int ServerRDMA::setup_mem_region(std::size_t buf_size) {
@@ -463,6 +598,11 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 		std::exit(EXIT_FAILURE);
 	}
 
+	if (rdma_create_id(ev_channel_, &mcast_cm_id_, NULL, RDMA_PS_UDP)) {
+		std::cerr << "rdma_create_id() failed: " << std::strerror(errno) << "\n";
+		return;
+	}
+
 	struct rdma_addrinfo hints;
 	std::memset(&hints, 0, sizeof(hints));
 	hints.ai_port_space = RDMA_PS_TCP;
@@ -479,6 +619,11 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	if (rdma_bind_addr(cm_id_, res->ai_src_addr)) {
 		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
 		std::exit(EXIT_FAILURE);
+	}
+
+	// Bind the RDMA CM identifier to the source address and port.
+	if (rdma_bind_addr(mcast_cm_id_, res->ai_src_addr)) {
+		std::cerr << "[2]rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
 	}
 
 	// Start listening for incoming connection requests while allowing for a
@@ -579,7 +724,7 @@ int main(int argc, char *argv[]) {
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
 	std::cout << "Pausing for 30sec." << std::endl;
-	std::chrono::milliseconds pause_tm(30000);
+	std::chrono::milliseconds pause_tm(50000);
 	std::this_thread::sleep_for(pause_tm);
 
 	return 0;
