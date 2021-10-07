@@ -120,6 +120,8 @@ class ServerRDMA {
 
 	struct sockaddr src_addr_;
 
+	char *mcast_msg;
+
 	void *buf_;
 
 	// Vector of the RDMA CM ids of the connected clients.
@@ -291,27 +293,28 @@ int ServerRDMA::recv_mcast_dummy_msg() {
 	struct ibv_recv_wr wr;
 	struct ibv_recv_wr *bad_wr;
 	std::size_t msg_len = sizeof "Hello mcast world!";
+	std::size_t total_len = msg_len + sizeof(struct ibv_grh);
 
-	char* msg = reinterpret_cast<char*>(malloc(msg_len));
+	mcast_msg = reinterpret_cast<char*>(malloc(total_len));
 
 	struct ibv_mr *recv_mr;
-	recv_mr = ibv_reg_mr(pd_, &msg, msg_len,
+	recv_mr = ibv_reg_mr(pd_, mcast_msg, total_len,
 			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 	if (recv_mr == nullptr) {
 		std::cerr << "ibv_reg_mr failed.\n";
 	}
 
-	sg.addr = reinterpret_cast<uint64_t>(&msg);
-	sg.length = msg_len;
+	sg.addr = reinterpret_cast<uint64_t>(mcast_msg);
+	sg.length = total_len;
 	sg.lkey = recv_mr->lkey;
 
 	wr.wr_id = 420;
 	wr.next = NULL;
-	// wr.sg_list = &sg;
-	// wr.num_sge = 1;
+	wr.sg_list = &sg;
+	wr.num_sge = 1;
 	//
-	wr.sg_list = NULL;
-	wr.num_sge = 0;
+	//wr.sg_list = NULL;
+	//wr.num_sge = 0;
 
 	if (ibv_post_recv(mcast_qp_, &wr, &bad_wr)) {
 		std::cerr << "ibv_post_recv() failed.\n";
@@ -449,6 +452,7 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
 
 			join_mcast_group();
+			recv_mcast_dummy_msg();
 
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			break;
@@ -465,7 +469,14 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
 			std::cout << "Joined multicast group successfully.\n";
-			recv_mcast_dummy_msg();
+			union ibv_gid mgid;
+			std::memcpy(mgid.raw, mcast_info_msg.gid_raw, 16);
+			if (ibv_attach_mcast(mcast_qp_, &mgid, mcast_info_msg.lid)) {
+				std::cerr << "ibv_attach_mcast() failed.\n";
+			} else {
+				std::cout << "Attached to mcast group successfully.\n";
+			}
+
 			n_conns_++;
 			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
@@ -716,7 +727,33 @@ int ServerRDMA::WaitForClients(int n_clients) {
 		std::cerr << "rmda_get_cm_event() failed: " << std::strerror(errno) << "\n";
 	}
 
-	std::cout << "Polling for mcast dummy msg.\n";
+	struct ibv_wc wc;
+	std::chrono::milliseconds pause_tm(2000);
+
+	std::cout << "Polling for mcast dummy msg (wait up to 10s).\n";
+	int retries = 5;
+	while (retries > 0) {
+		int ret = ibv_poll_cq(mcast_cq_, 1, &wc);
+		if (ret != 0) {
+			break;
+		}
+		std::this_thread::sleep_for(pause_tm);
+		retries--;
+	}
+
+	if (retries <= 0) {
+		std::cout << "No multicast message received.\n";
+	} else {
+		if (wc.status != IBV_WC_SUCCESS) {
+			std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
+								<< ", work request ID: " << wc.wr_id << std::endl;
+			return -1;
+		}
+		std::cout << "Received mcast message with wr_id = " << wc.wr_id << "\n";
+		//std::string msg_received(mcast_msg + sizeof(struct ibv_grh));
+		//std::string msg_received(mcast_msg);
+		std::cout << "Message = " << &mcast_msg[sizeof(struct ibv_grh)] << std::endl;
+	}
 
 	/*
 	struct ibv_wc wc;
@@ -724,13 +761,7 @@ int ServerRDMA::WaitForClients(int n_clients) {
 		// nothing
 	}
 
-	if (wc.status != IBV_WC_SUCCESS) {
-		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
-							<< ", work request ID: " << wc.wr_id << std::endl;
-		return -1;
-	}
 
-	std::cout << "Received mcast message with wr_id = " << wc.wr_id << "\n";
 	*/
 
 	return n_conns_;
@@ -781,8 +812,8 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Pausing for 30sec." << std::endl;
-	std::chrono::milliseconds pause_tm(50000);
+	std::cout << "Pausing for 20sec." << std::endl;
+	std::chrono::milliseconds pause_tm(20000);
 	std::this_thread::sleep_for(pause_tm);
 
 	return 0;

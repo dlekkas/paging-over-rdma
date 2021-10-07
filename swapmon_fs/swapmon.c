@@ -613,7 +613,7 @@ static int init_ud_comms(void) {
 
 
 static int send_dummy_mcast_msg(void) {
-	struct ib_ud_wr ud_wr = {};
+	struct ib_ud_wr ud_wr;
 	struct ib_send_wr *bad_wr;
 	struct ib_sge sg;
 	struct ib_wc wc;
@@ -651,10 +651,11 @@ static int send_dummy_mcast_msg(void) {
 
 	ud_wr.wr.next = NULL;
 	ud_wr.wr.wr_id = 420;
-	ud_wr.wr.sg_list = NULL;
-	ud_wr.wr.num_sge = 0;
-	ud_wr.wr.opcode = IB_WR_SEND;
+	ud_wr.wr.sg_list = &sg;
+	ud_wr.wr.num_sge = 1;
+	ud_wr.wr.opcode = IB_WR_SEND_WITH_IMM;
 	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
+	ud_wr.wr.ex.imm_data = htonl(ctrl->mcast_qp->qp_num);
 
 	ud_wr.ah = ctrl->mcast_ah;
 	ud_wr.remote_qpn = ctrl->remote_mcast_qpn;
@@ -1061,8 +1062,10 @@ static int rdma_conn_init(void) {
 	if (ret)
 		goto err_unreg_client;
 
-	mdelay(5000);
+	pr_info("delaying for 10s.\n");
+	mdelay(10000);
 	send_dummy_mcast_msg();
+	pr_info("done delaying.\n");
 
 	return 0;
 
