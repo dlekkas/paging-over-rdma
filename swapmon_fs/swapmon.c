@@ -5,6 +5,7 @@
 #include <linux/memcontrol.h>
 #include <linux/smp.h>
 #include <linux/inet.h>
+#include <linux/delay.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
@@ -66,6 +67,11 @@ struct swapmon_rdma_ctrl {
 	struct server_info server;
 
 	struct ib_ah *ah;
+
+	struct ib_ah *mcast_ah;
+
+	u32 remote_mcast_qpn;
+	u32 remote_mcast_qkey;
 
 	spinlock_t cq_lock;
 
@@ -461,6 +467,7 @@ static int send_dummy_ud_msg(void) {
 	struct ib_ud_wr ud_wr = {};
 	struct ib_send_wr *bad_wr;
 	struct ib_sge sg;
+	struct ib_wc wc;
 	u64 dma_addr;
 
 	char* msg;
@@ -601,6 +608,78 @@ static int init_ud_comms(void) {
 	}
 
 	pr_info("address handle created succesfully.\n");
+	return 0;
+}
+
+
+static int send_dummy_mcast_msg(void) {
+	struct ib_ud_wr ud_wr = {};
+	struct ib_send_wr *bad_wr;
+	struct ib_sge sg;
+	struct ib_wc wc;
+	u64 dma_addr;
+	char* msg;
+	size_t msg_len;
+	int ret;
+
+	msg_len = sizeof("Hello mcast world!");
+	msg = kzalloc(msg_len, GFP_KERNEL);
+	if (!msg) {
+		pr_err("kzalloc failed to allocate mem for dummy mcast msg.\n");
+		return -ENOMEM;
+	}
+	strcpy(msg, "Hello mcast world!");
+
+	pr_info("send_dummy_mcast_msg(): kzalloc() and strcpy() for msg success.\n");
+	pr_info("msg_len = %d\n", msg_len);
+
+	dma_addr = ib_dma_map_single(ctrl->dev, msg,
+			msg_len, DMA_BIDIRECTIONAL);
+	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+		pr_err("dma address mapping error.\n");
+	}
+
+	// Prepare DMA region to be accessed by device.
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			msg_len, DMA_BIDIRECTIONAL);
+
+	pr_info("send_dummy_mcast_msg(): dma mappings ready.\n");
+
+	sg.addr = dma_addr;
+	sg.length = msg_len;
+	sg.lkey = ctrl->mcast_pd->local_dma_lkey;
+
+	ud_wr.wr.next = NULL;
+	ud_wr.wr.wr_id = 420;
+	ud_wr.wr.sg_list = NULL;
+	ud_wr.wr.num_sge = 0;
+	ud_wr.wr.opcode = IB_WR_SEND;
+	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
+
+	ud_wr.ah = ctrl->mcast_ah;
+	ud_wr.remote_qpn = ctrl->remote_mcast_qpn;
+	ud_wr.remote_qkey = ctrl->remote_mcast_qkey;
+
+	// delay for 3sec for other peer to join mcast group
+	// mdelay(3000);
+
+	ret = ib_post_send(ctrl->mcast_qp, &ud_wr.wr, &bad_wr);
+	if (ret) {
+		pr_err("ib_post_send failed to send dummy msg.\n");
+	}
+
+	while (!ib_poll_cq(ctrl->mcast_qp->send_cq, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IB_WC_SUCCESS) {
+		printk("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc.status), wc.wr_id);
+		return wc.status;
+	}
+	pr_info("wc succeeded wr_id = %llu", wc.wr_id);
+
+	pr_info("send_dummy_mcast_msg completed.\n");
 	return 0;
 }
 
@@ -779,7 +858,16 @@ static int mcast_join_handler(struct rdma_ud_param *param) {
 			rdma_ah_get_sl(&param->ah_attr), rdma_ah_get_path_bits(&param->ah_attr),
 			param->qp_num, param->qkey);
 
+	ctrl->remote_mcast_qpn = param->qp_num;
+	ctrl->remote_mcast_qkey = param->qkey;
+
 	send_mcast_grp_info(ctrl->qp, param);
+
+	ctrl->mcast_ah = rdma_create_ah(ctrl->mcast_pd, &param->ah_attr);
+	if (!ctrl->mcast_ah) {
+		pr_err("rdma_create_ah() failed for multicast AH.\n");
+		return PTR_ERR(ctrl->mcast_ah);
+	}
 
 	pr_info("mcast_join_handler done.\n");
 
@@ -972,6 +1060,9 @@ static int rdma_conn_init(void) {
 	ret = swapmon_rdma_create_ctrl();
 	if (ret)
 		goto err_unreg_client;
+
+	mdelay(5000);
+	send_dummy_mcast_msg();
 
 	return 0;
 

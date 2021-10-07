@@ -88,6 +88,8 @@ class ServerRDMA {
 
 	int recv_mcast_grp_info(struct ibv_qp *qp);
 
+	int recv_mcast_dummy_msg();
+
 	void join_mcast_group();
 
 	void init_mcast_rdma_resources();
@@ -284,6 +286,42 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	return 0;
 }
 
+int ServerRDMA::recv_mcast_dummy_msg() {
+	struct ibv_sge sg;
+	struct ibv_recv_wr wr;
+	struct ibv_recv_wr *bad_wr;
+	std::size_t msg_len = sizeof "Hello mcast world!";
+
+	char* msg = reinterpret_cast<char*>(malloc(msg_len));
+
+	struct ibv_mr *recv_mr;
+	recv_mr = ibv_reg_mr(pd_, &msg, msg_len,
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+	if (recv_mr == nullptr) {
+		std::cerr << "ibv_reg_mr failed.\n";
+	}
+
+	sg.addr = reinterpret_cast<uint64_t>(&msg);
+	sg.length = msg_len;
+	sg.lkey = recv_mr->lkey;
+
+	wr.wr_id = 420;
+	wr.next = NULL;
+	// wr.sg_list = &sg;
+	// wr.num_sge = 1;
+	//
+	wr.sg_list = NULL;
+	wr.num_sge = 0;
+
+	if (ibv_post_recv(mcast_qp_, &wr, &bad_wr)) {
+		std::cerr << "ibv_post_recv() failed.\n";
+		return -1;
+	}
+
+	std::cout << "recv_mcast_dummy_msg() completed successfully.\n";
+	return 0;
+}
+
 int ServerRDMA::recv_mcast_grp_info(struct ibv_qp *qp) {
 	struct ibv_sge sg;
 	struct ibv_recv_wr wr;
@@ -427,6 +465,7 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
 			std::cout << "Joined multicast group successfully.\n";
+			recv_mcast_dummy_msg();
 			n_conns_++;
 			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
@@ -498,6 +537,8 @@ void ServerRDMA::init_mcast_rdma_resources() {
 	if (rdma_create_qp(mcast_cm_id_, pd_, &attr)) {
 		std::cerr << "[2]rdma_create_qp() failed: " << std::strerror(errno) << "\n";
 	}
+
+	mcast_qp_ = mcast_cm_id_->qp;
 }
 
 void ServerRDMA::join_mcast_group() {
@@ -674,6 +715,23 @@ int ServerRDMA::WaitForClients(int n_clients) {
 	if (n_conns_ < n_clients) {
 		std::cerr << "rmda_get_cm_event() failed: " << std::strerror(errno) << "\n";
 	}
+
+	std::cout << "Polling for mcast dummy msg.\n";
+
+	/*
+	struct ibv_wc wc;
+	while (!ibv_poll_cq(mcast_cq_, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IBV_WC_SUCCESS) {
+		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
+							<< ", work request ID: " << wc.wr_id << std::endl;
+		return -1;
+	}
+
+	std::cout << "Received mcast message with wr_id = " << wc.wr_id << "\n";
+	*/
 
 	return n_conns_;
 }
