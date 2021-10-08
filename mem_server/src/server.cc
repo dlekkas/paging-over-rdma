@@ -30,6 +30,12 @@ constexpr std::size_t BUFFER_SIZE(16 * 4096);
 constexpr int MIN_CQE(8192);
 
 
+enum comm_ctrl_opcode {
+	MCAST_MEMBERSHIP_NACK,
+	MCAST_MEMBERSHIP_ACK
+};
+
+
 class ConnectionRDMA {
  public:
 	struct rdma_cm_id* id;
@@ -91,6 +97,8 @@ class ServerRDMA {
 	int recv_mcast_dummy_msg();
 
 	void join_mcast_group();
+
+	int send_control_msg(comm_ctrl_opcode op);
 
 	void init_mcast_rdma_resources();
 
@@ -288,6 +296,35 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	return 0;
 }
 
+int ServerRDMA::send_control_msg(comm_ctrl_opcode op) {
+	struct ibv_send_wr wr, *bad_wr;
+	wr.wr_id = 1000;
+	wr.next = nullptr;
+
+	wr.sg_list = nullptr;
+	wr.num_sge = 0;
+	wr.opcode = IBV_WR_SEND_WITH_IMM;
+	wr.send_flags = IBV_SEND_SIGNALED;
+	wr.imm_data = htonl(op);
+
+	if (ibv_post_send(cm_id_->qp, &wr, &bad_wr)) {
+		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
+		return -1;
+	}
+
+	struct ibv_wc wc;
+	while (!ibv_poll_cq(cm_id_->qp->send_cq, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IBV_WC_SUCCESS) {
+		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
+							<< ", work request ID: " << wc.wr_id << std::endl;
+		return -1;
+	}
+	return 0;
+}
+
 int ServerRDMA::recv_mcast_dummy_msg() {
 	struct ibv_sge sg;
 	struct ibv_recv_wr wr;
@@ -312,9 +349,6 @@ int ServerRDMA::recv_mcast_dummy_msg() {
 	wr.next = NULL;
 	wr.sg_list = &sg;
 	wr.num_sge = 1;
-	//
-	//wr.sg_list = NULL;
-	//wr.num_sge = 0;
 
 	if (ibv_post_recv(mcast_qp_, &wr, &bad_wr)) {
 		std::cerr << "ibv_post_recv() failed.\n";
@@ -447,7 +481,6 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			}
 
 			std::cout << "Received message with wr_id = " << wc.wr_id << "\n";
-			std::cout << "gid = " << mcast_info_msg.gid_raw << "\n";
 			std::cout << "lid = " << mcast_info_msg.lid << "\n";
 			std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
 
@@ -476,6 +509,8 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			} else {
 				std::cout << "Attached to mcast group successfully.\n";
 			}
+
+			send_control_msg(MCAST_MEMBERSHIP_ACK);
 
 			n_conns_++;
 			break;
@@ -522,10 +557,10 @@ void ServerRDMA::init_mcast_rdma_resources() {
 	}
 	*/
 
+	/*
 	struct sockaddr_in sa;
 	inet_pton(AF_INET, "192.168.1.20", &(sa.sin_addr));
 
-	/*
 	std::cout << "bindaddr()\n";
 	if (rdma_bind_addr(mcast_cm_id_, (struct sockaddr *) &sa)) {
 		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
@@ -575,22 +610,6 @@ void ServerRDMA::join_mcast_group() {
 	if (rdma_getaddrinfo(mcast_addr_str.c_str(), NULL, &hints, &addrinfo)) {
 		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
 	}
-
-	/*
-	std::string ip("192.168.1.20");
-
-	struct rdma_addrinfo *res;
-	if (rdma_getaddrinfo(ip.c_str(), NULL, NULL, &res)) {
-		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
-		std::exit(EXIT_FAILURE);
-	}
-	*/
-
-	/*
-	if (rdma_bind_addr(mcast_cm_id_, res->ai_src_addr)) {
-		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
-	}
-	*/
 
 	struct rdma_cm_join_mc_attr_ex mc_join_attr;
 	mc_join_attr.comp_mask = RDMA_CM_JOIN_MC_ATTR_ADDRESS |
@@ -714,6 +733,25 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 	}
 }
 
+// Helper function mainly used to ensure that we are not polling forever
+// if something goes wrong which causes the kernel driver to crash.
+int poll_cq_with_timeout(struct ibv_cq* cq, int num_entries,
+		struct ibv_wc *wc, int timeout_ms) {
+	const int freq = 100; // ms
+	int retries = timeout_ms / freq + 1;
+
+	std::chrono::milliseconds sleep_ms(freq);
+	while (retries > 0) {
+		int ret = ibv_poll_cq(cq, num_entries, wc);
+		if (ret != 0) {
+			return ret;
+		}
+		std::this_thread::sleep_for(sleep_ms);
+		retries--;
+	}
+	return 0;
+}
+
 int ServerRDMA::WaitForClients(int n_clients) {
 	// Retrieve communication events until `n_clients` have successfully
 	// established their connection with our server.
@@ -727,21 +765,13 @@ int ServerRDMA::WaitForClients(int n_clients) {
 		std::cerr << "rmda_get_cm_event() failed: " << std::strerror(errno) << "\n";
 	}
 
-	struct ibv_wc wc;
-	std::chrono::milliseconds pause_tm(2000);
-
 	std::cout << "Polling for mcast dummy msg (wait up to 10s).\n";
-	int retries = 5;
-	while (retries > 0) {
-		int ret = ibv_poll_cq(mcast_cq_, 1, &wc);
-		if (ret != 0) {
-			break;
-		}
-		std::this_thread::sleep_for(pause_tm);
-		retries--;
-	}
 
-	if (retries <= 0) {
+	struct ibv_wc wc;
+	int timeout_ms = 10000;
+	int ret = poll_cq_with_timeout(mcast_cq_, 1, &wc, timeout_ms);
+
+	if (ret <= 0) {
 		std::cout << "No multicast message received.\n";
 	} else {
 		if (wc.status != IBV_WC_SUCCESS) {
@@ -750,8 +780,6 @@ int ServerRDMA::WaitForClients(int n_clients) {
 			return -1;
 		}
 		std::cout << "Received mcast message with wr_id = " << wc.wr_id << "\n";
-		//std::string msg_received(mcast_msg + sizeof(struct ibv_grh));
-		//std::string msg_received(mcast_msg);
 		std::cout << "Message = " << &mcast_msg[sizeof(struct ibv_grh)] << std::endl;
 	}
 
@@ -760,8 +788,6 @@ int ServerRDMA::WaitForClients(int n_clients) {
 	while (!ibv_poll_cq(mcast_cq_, 1, &wc)) {
 		// nothing
 	}
-
-
 	*/
 
 	return n_conns_;

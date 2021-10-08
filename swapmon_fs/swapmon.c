@@ -15,12 +15,19 @@
 #include <linux/init.h>
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
+#define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
 #define UC_QKEY 0x11111111
 
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
+
+enum comm_ctrl_opcode {
+	MCAST_MEMBERSHIP_NACK,
+	MCAST_MEMBERSHIP_ACK
+};
+
 
 struct mem_info {
 	u64 addr;
@@ -84,6 +91,8 @@ struct swapmon_rdma_ctrl {
 	struct completion cm_done;
 	atomic_t pending;
 	int cm_error;
+
+	struct completion mcast_ack;
 
 	int queue_size;
 
@@ -661,9 +670,6 @@ static int send_dummy_mcast_msg(void) {
 	ud_wr.remote_qpn = ctrl->remote_mcast_qpn;
 	ud_wr.remote_qkey = ctrl->remote_mcast_qkey;
 
-	// delay for 3sec for other peer to join mcast group
-	// mdelay(3000);
-
 	ret = ib_post_send(ctrl->mcast_qp, &ud_wr.wr, &bad_wr);
 	if (ret) {
 		pr_err("ib_post_send failed to send dummy msg.\n");
@@ -678,9 +684,8 @@ static int send_dummy_mcast_msg(void) {
 					 ib_wc_status_msg(wc.status), wc.wr_id);
 		return wc.status;
 	}
-	pr_info("wc succeeded wr_id = %llu", wc.wr_id);
-
 	pr_info("send_dummy_mcast_msg completed.\n");
+
 	return 0;
 }
 
@@ -875,6 +880,63 @@ static int mcast_join_handler(struct rdma_ud_param *param) {
 	return 0;
 }
 
+
+static void recv_control_msg_done(struct ib_cq* cq, struct ib_wc* wc) {
+	enum comm_ctrl_opcode op;
+	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+		pr_err("control message WC failed with status: %s\n",
+				ib_wc_status_msg(wc->status));
+		return;
+	}
+
+	if (!(wc->wc_flags & IB_WC_WITH_IMM)) {
+		pr_err("control message should always contain IMM data.\n");
+		return;
+	}
+
+	op = ntohl(wc->ex.imm_data);
+	switch(op) {
+		case MCAST_MEMBERSHIP_ACK:
+			pr_info("Mem server joined multicast group.\n");
+			complete(&ctrl->mcast_ack);
+			break;
+		case MCAST_MEMBERSHIP_NACK:
+			pr_info("Mem server failed to join multicast group.\n");
+			break;
+		default:
+			pr_err("Unrecognized control message with code: %u\n", op);
+			break;
+	}
+}
+
+// This function tries to post `num_recvs` Receive Requests (RR) and
+// returns the number of RRs that it posted successfull.
+static int post_recv_control_msg(int num_recvs) {
+	struct ib_recv_wr wr, *bad_wr;
+	int i, ret;
+
+	wr.next    = NULL;
+	wr.num_sge = 1;
+	wr.sg_list = NULL;
+
+	wr.wr_cqe = (struct ib_cqe *) kzalloc(sizeof(*wr.wr_cqe), GFP_KERNEL);
+	if (!wr.wr_cqe) {
+		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
+		return 0;
+	}
+	wr.wr_cqe->done = recv_control_msg_done;
+
+	for (i = 0; i < num_recvs; i++) {
+		ret = ib_post_recv(ctrl->qp, &wr, &bad_wr);
+		if (unlikely(ret)) {
+			pr_info("%s: ib_post_recv() failed with exit code = %d\n", __func__, ret);
+			break;
+		}
+	}
+
+	return i;
+}
+
 // For connection establishment, a sample sequence consists of a Request (REQ)
 // from the client to the server, a Reply (REP) from the server to the client
 // (to indicate that the request was accepted), and a Ready To Use (RTU) from
@@ -929,6 +991,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
 			cm_error = mcast_join_handler(&event->param.ud);
 			pr_info("multicast join operation completed successfully.\n");
+			post_recv_control_msg(1);
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);
 			break;
@@ -952,6 +1015,10 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 	return 0;
 }
 
+static void swapmon_wait_for_mcast_ack(void) {
+	wait_for_completion_interruptible_timeout(&ctrl->mcast_ack,
+			msecs_to_jiffies(SWAPMON_MCAST_JOIN_TIMEOUT_MS) + 1);
+}
 
 static int swapmon_rdma_wait_for_cm(void) {
 	wait_for_completion_interruptible_timeout(&ctrl->cm_done,
@@ -999,6 +1066,7 @@ static int swapmon_rdma_create_ctrl(void) {
 		pr_info("src and dst addresses parsed successfully.\n");
 
 		init_completion(&ctrl->cm_done);
+		init_completion(&ctrl->mcast_ack);
 		atomic_set(&ctrl->pending, 0);
 		spin_lock_init(&ctrl->cq_lock);
 
@@ -1062,8 +1130,12 @@ static int rdma_conn_init(void) {
 	if (ret)
 		goto err_unreg_client;
 
-	pr_info("delaying for 10s.\n");
-	mdelay(10000);
+	pr_info("delaying for 2s.\n");
+	mdelay(2000);
+
+	// make sure that remote server has joined the mcast group
+	// swapmon_wait_for_mcast_ack();
+
 	send_dummy_mcast_msg();
 	pr_info("done delaying.\n");
 
