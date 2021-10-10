@@ -122,6 +122,8 @@ class ServerRDMA {
 
 	struct ibv_pd *pd_;
 
+	struct ibv_qp *rc_qp_;
+
 	struct ibv_qp *ud_qp_;
 
 	struct ibv_qp *mcast_qp_;
@@ -144,6 +146,25 @@ class ServerRDMA {
 		uint32_t qkey;
 	} mcast_info_msg;
 };
+
+// Helper function mainly used to ensure that we are not polling forever
+// if something goes wrong which causes the kernel driver to crash.
+int poll_cq_with_timeout(struct ibv_cq* cq, int num_entries,
+		struct ibv_wc *wc, int timeout_ms) {
+	const int freq = 100; // ms
+	int retries = timeout_ms / freq + 1;
+
+	std::chrono::milliseconds sleep_ms(freq);
+	while (retries > 0) {
+		int ret = ibv_poll_cq(cq, num_entries, wc);
+		if (ret != 0) {
+			return ret;
+		}
+		std::this_thread::sleep_for(sleep_ms);
+		retries--;
+	}
+	return 0;
+}
 
 int ServerRDMA::extract_pkey_index(uint8_t port_num, __be16 pkey) {
 	struct ibv_port_attr port_info = {};
@@ -278,6 +299,7 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 		std::cerr << "rdma_create_qp() failed: " << std::strerror(errno) << "\n";
 		return 1;
 	}
+	rc_qp_ = client_cm_id->qp;
 
 	struct rdma_conn_param conn_param;
 	std::memset(&conn_param, 0, sizeof(conn_param));
@@ -299,22 +321,26 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 int ServerRDMA::send_control_msg(comm_ctrl_opcode op) {
 	struct ibv_send_wr wr, *bad_wr;
 	wr.wr_id = 1000;
-	wr.next = nullptr;
+	wr.next = NULL;
 
-	wr.sg_list = nullptr;
+	wr.sg_list = NULL;
 	wr.num_sge = 0;
 	wr.opcode = IBV_WR_SEND_WITH_IMM;
 	wr.send_flags = IBV_SEND_SIGNALED;
 	wr.imm_data = htonl(op);
 
-	if (ibv_post_send(cm_id_->qp, &wr, &bad_wr)) {
+	if (ibv_post_send(rc_qp_, &wr, &bad_wr)) {
 		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
 		return -1;
 	}
 
 	struct ibv_wc wc;
-	while (!ibv_poll_cq(cm_id_->qp->send_cq, 1, &wc)) {
-		// nothing
+	int timeout_ms = 10000;
+	int ret = poll_cq_with_timeout(rc_qp_->send_cq, 1, &wc, timeout_ms);
+
+	if (ret <= 0) {
+		std::cout << "Failure when sending control message.\n";
+		return ret;
 	}
 
 	if (wc.status != IBV_WC_SUCCESS) {
@@ -731,25 +757,6 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 		std::cerr << "ibv_create_cq failed: " << std::strerror(errno) << "\n";
 		std::exit(EXIT_FAILURE);
 	}
-}
-
-// Helper function mainly used to ensure that we are not polling forever
-// if something goes wrong which causes the kernel driver to crash.
-int poll_cq_with_timeout(struct ibv_cq* cq, int num_entries,
-		struct ibv_wc *wc, int timeout_ms) {
-	const int freq = 100; // ms
-	int retries = timeout_ms / freq + 1;
-
-	std::chrono::milliseconds sleep_ms(freq);
-	while (retries > 0) {
-		int ret = ibv_poll_cq(cq, num_entries, wc);
-		if (ret != 0) {
-			return ret;
-		}
-		std::this_thread::sleep_for(sleep_ms);
-		retries--;
-	}
-	return 0;
 }
 
 int ServerRDMA::WaitForClients(int n_clients) {

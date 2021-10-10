@@ -474,10 +474,11 @@ static int mcast_logic(void) {
 #define UD_DUMMY_MSG "hello UD world!"
 static int send_dummy_ud_msg(void) {
 	struct ib_ud_wr ud_wr = {};
-	struct ib_send_wr *bad_wr;
+	// struct ib_send_wr *bad_wr;
 	struct ib_sge sg;
-	struct ib_wc wc;
+	// struct ib_wc wc;
 	u64 dma_addr;
+	// int ret;
 
 	char* msg;
 	msg = kzalloc(sizeof(UD_DUMMY_MSG)+1, GFP_KERNEL);
@@ -511,7 +512,6 @@ static int send_dummy_ud_msg(void) {
 	ud_wr.remote_qpn = ctrl->server.ud_transport.qpn;
 	ud_wr.remote_qkey = ctrl->server.ud_transport.qkey;
 
-	int ret;
 	/*
 	ret = ib_post_send(ctrl->ud_qp, &ud_wr.wr, &bad_wr);
 	if (ret) {
@@ -640,7 +640,7 @@ static int send_dummy_mcast_msg(void) {
 	strcpy(msg, "Hello mcast world!");
 
 	pr_info("send_dummy_mcast_msg(): kzalloc() and strcpy() for msg success.\n");
-	pr_info("msg_len = %d\n", msg_len);
+	pr_info("msg_len = %lu\n", msg_len);
 
 	dma_addr = ib_dma_map_single(ctrl->dev, msg,
 			msg_len, DMA_BIDIRECTIONAL);
@@ -883,6 +883,7 @@ static int mcast_join_handler(struct rdma_ud_param *param) {
 
 static void recv_control_msg_done(struct ib_cq* cq, struct ib_wc* wc) {
 	enum comm_ctrl_opcode op;
+	pr_info("%s()\n", __func__);
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
 		pr_err("control message WC failed with status: %s\n",
 				ib_wc_status_msg(wc->status));
@@ -916,10 +917,10 @@ static int post_recv_control_msg(int num_recvs) {
 	int i, ret;
 
 	wr.next    = NULL;
-	wr.num_sge = 1;
+	wr.num_sge = 0;
 	wr.sg_list = NULL;
 
-	wr.wr_cqe = (struct ib_cqe *) kzalloc(sizeof(*wr.wr_cqe), GFP_KERNEL);
+	wr.wr_cqe = (struct ib_cqe *) kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
 	if (!wr.wr_cqe) {
 		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
 		return 0;
@@ -934,6 +935,7 @@ static int post_recv_control_msg(int num_recvs) {
 		}
 	}
 
+	pr_info("%s(%d) completed successfully.\n", __func__, num_recvs);
 	return i;
 }
 
@@ -963,8 +965,6 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			if (ret) {
 				pr_err("unable to receive remote mem info.\n");
 			}
-			//init_ud_comms();
-			//send_dummy_ud_msg();
 			mcast_logic();
 			break;
 		case RDMA_CM_EVENT_ROUTE_ERROR:
@@ -989,9 +989,9 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
 			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
+			post_recv_control_msg(1);
 			cm_error = mcast_join_handler(&event->param.ud);
 			pr_info("multicast join operation completed successfully.\n");
-			post_recv_control_msg(1);
 			ctrl->cm_error = 0;
 			complete(&ctrl->cm_done);
 			break;
@@ -1130,14 +1130,11 @@ static int rdma_conn_init(void) {
 	if (ret)
 		goto err_unreg_client;
 
-	pr_info("delaying for 2s.\n");
-	mdelay(2000);
-
 	// make sure that remote server has joined the mcast group
-	// swapmon_wait_for_mcast_ack();
+	swapmon_wait_for_mcast_ack();
 
+	// send dummy message since remote peer joined
 	send_dummy_mcast_msg();
-	pr_info("done delaying.\n");
 
 	return 0;
 
