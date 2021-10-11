@@ -118,12 +118,138 @@ static void swapmon_init(unsigned swap_type) {
 	printk("swapmon_init(%d)", swap_type);
 }
 
+static int swapmon_mcast_send(u64 dma_addr, size_t size) {
+	struct ib_send_wr *bad_wr;
+	struct ib_ud_wr ud_wr;
+	struct ib_sge sge;
+	int ret;
+
+	sge.addr = dma_addr;
+	sge.length = size;
+	sge.lkey = ctrl->mcast_pd->local_dma_lkey;
+
+	ud_wr.wr.next = NULL;
+	/*
+	ud_wr.wr.wr_cqe = (struct ib_cqe *)
+		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
+	if (!ud_wr.wr.wr_cqe) {
+		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
+		return -ENOMEM;
+	}
+	ud_wr.wr.wr_cqe->done = send_mcast_page_done;
+	*/
+	ud_wr.wr.wr_id = 1111;
+	ud_wr.wr.sg_list = &sge;
+	ud_wr.wr.num_sge = 1;
+	ud_wr.wr.opcode = IB_WR_SEND_WITH_IMM;
+	ud_wr.wr.ex.imm_data = htonl(ctrl->mcast_qp->qp_num);
+
+	ud_wr.ah = ctrl->mcast_ah;
+	ud_wr.remote_qpn = ctrl->remote_mcast_qpn;
+	ud_wr.remote_qkey = ctrl->remote_mcast_qkey;
+
+	ret = ib_post_send(ctrl->mcast_qp, &ud_wr.wr, &bad_wr);
+	if (ret) {
+		pr_err("ib_post_send failed to send page.\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+static int post_recv_page_ack_msg(pgoff_t offset) {
+	struct ib_recv_wr wr, *bad_wr;
+	struct ib_sge sge;
+	u64 dma_addr;
+	int ret;
+
+	u64* remote_addr;
+	remote_addr = kzalloc(sizeof(u64), GFP_KERNEL);
+	if (unlikely(!remote_addr)) {
+		pr_err("kzalloc failed to allocate mem for u64.\n");
+		return -ENOMEM;
+	}
+
+	dma_addr = ib_dma_map_single(ctrl->dev, remote_addr,
+			sizeof(u64), DMA_FROM_DEVICE);
+	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+		pr_err("dma address mapping error.\n");
+		return -1;
+	}
+
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			sizeof(u64), DMA_FROM_DEVICE);
+
+	sge.addr = dma_addr;
+	sge.length = sizeof(u64);
+	sge.lkey = ctrl->pd->local_dma_lkey;
+
+	wr.next = NULL;
+	wr.wr_id = offset;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+
+	ret = ib_post_recv(ctrl->qp, &wr, &bad_wr);
+	if (ret) {
+		pr_err("ib_post_recv failed to post RR for page ack.\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
+	int ret;
+	u64 dma_addr;
+	bool done;
+	int retries;
+	struct ib_wc wc;
 	printk("swapmon: store(swap_type = %-10u, offset = %lu)\n",
 				 swap_type, offset);
+
+  dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
+			PAGE_SIZE, DMA_TO_DEVICE);
+	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
+		pr_err("%s: dma mapping error\n", __func__);
+		return -1;
+	}
+
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			PAGE_SIZE, DMA_TO_DEVICE);
+
+	post_recv_page_ack_msg(offset);
+
+	ret = swapmon_mcast_send(dma_addr, PAGE_SIZE);
+	if (ret) {
+		pr_err("%s() failed.\n", __func__);
+		return -1;
+	}
+
+	done = false;
+	retries = 50000;
+	while (!done) {
+		ret = ib_poll_cq(ctrl->cq, 1, &wc);
+		if (ret > 0) {
+			if (wc.status != IB_WC_SUCCESS) {
+				pr_err("Polling failed with status %s " "(work request ID = %llu).\n",
+						ib_wc_status_msg(wc.status), wc.wr_id);
+				return -1;
+			} else if (wc.wr_id == offset) {
+				pr_info("successfully received page ACK.\n");
+				done = true;
+			}
+		}
+		retries--;
+		if (retries <= 0) {
+			done = true;
+		}
+	}
+
 	return -1;
 }
+
 
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
@@ -1145,14 +1271,14 @@ err_unreg_client:
 
 static int __init swapmonfs_init(void) {
 	int ret;
-	frontswap_register_ops(&swapmon_fs_ops);
-	printk("swapmon: registered frontswap ops\n");
 	ret = rdma_conn_init();
 	if (!ret) {
 		printk("swapmon: rdma connection established successfully\n");
 	}
-	printk("swapmon: module loaded successfully.\n");
 
+	frontswap_register_ops(&swapmon_fs_ops);
+	printk("swapmon: registered frontswap ops\n");
+	printk("swapmon: module loaded successfully.\n");
 	return 0;
 }
 
