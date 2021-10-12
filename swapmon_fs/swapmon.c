@@ -13,10 +13,13 @@
 #include <rdma/ib.h>
 
 #include <linux/init.h>
+#include <linux/hashtable.h>
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
 #define UC_QKEY 0x11111111
+
+int do_not_run = 0;
 
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
@@ -28,6 +31,14 @@ enum comm_ctrl_opcode {
 	MCAST_MEMBERSHIP_ACK
 };
 
+struct h_node {
+	u64 remote_addr;
+	pgoff_t offset;
+	struct hlist_node node;
+};
+
+// up to 2^10 = 1024 entries
+DECLARE_HASHTABLE(rmem_map, 10);
 
 struct mem_info {
 	u64 addr;
@@ -157,18 +168,11 @@ static int swapmon_mcast_send(u64 dma_addr, size_t size) {
 	return 0;
 }
 
-static int post_recv_page_ack_msg(pgoff_t offset) {
+static int post_recv_page_ack_msg(pgoff_t offset, u64* remote_addr) {
 	struct ib_recv_wr wr, *bad_wr;
 	struct ib_sge sge;
 	u64 dma_addr;
 	int ret;
-
-	u64* remote_addr;
-	remote_addr = kzalloc(sizeof(u64), GFP_KERNEL);
-	if (unlikely(!remote_addr)) {
-		pr_err("kzalloc failed to allocate mem for u64.\n");
-		return -ENOMEM;
-	}
 
 	dma_addr = ib_dma_map_single(ctrl->dev, remote_addr,
 			sizeof(u64), DMA_FROM_DEVICE);
@@ -199,6 +203,20 @@ static int post_recv_page_ack_msg(pgoff_t offset) {
 }
 
 
+// TODO(dimlek): here we should also consider the `swap_type`, since
+// we may have several.
+static u64 find_page_remote_addr(pgoff_t offset) {
+	struct h_node *curr;
+	hash_for_each_possible(rmem_map, curr, node, offset) {
+		if (curr->offset == offset) {
+			pr_info("hash table: remote addr for page offset = %lu found.\n", offset);
+			return curr->remote_addr;
+		}
+	}
+	pr_info("hash table: did not found remote addr for offset = %lu.\n", offset);
+	return 0;
+}
+
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	int ret;
@@ -206,8 +224,26 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	bool done;
 	int retries;
 	struct ib_wc wc;
+	struct h_node* rmem_info;
+
+	if (do_not_run) {
+		return -1;
+	} else {
+		do_not_run = 1;
+	}
+
 	printk("swapmon: store(swap_type = %-10u, offset = %lu)\n",
 				 swap_type, offset);
+
+	rmem_info = kzalloc(sizeof(*rmem_info), GFP_KERNEL);
+	if (unlikely(!rmem_info)) {
+		pr_err("kzalloc failed to allocate mem for u64.\n");
+		return -ENOMEM;
+	}
+	rmem_info->offset = offset;
+
+	// insert element into hash table
+	hash_add(rmem_map, &rmem_info->node, offset);
 
   dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
 			PAGE_SIZE, DMA_TO_DEVICE);
@@ -219,7 +255,8 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
 			PAGE_SIZE, DMA_TO_DEVICE);
 
-	post_recv_page_ack_msg(offset);
+	pr_info("starting post_recv_page_ack_msg");
+	post_recv_page_ack_msg(offset, &rmem_info->remote_addr);
 
 	ret = swapmon_mcast_send(dma_addr, PAGE_SIZE);
 	if (ret) {
@@ -247,14 +284,20 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		}
 	}
 
+	u64 addr = find_page_remote_addr(offset);
+	pr_info("remote addr = %llu\n", addr);
+
 	return -1;
 }
 
-
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
+	u64 rmem_addr;
+	rmem_addr = find_page_remote_addr(offset);
+
 	printk("swapmon: load(swap_type = %-10u, offset = %lu)\n",
 				 swap_type, offset);
+
 	return -1;
 }
 
@@ -1275,6 +1318,8 @@ static int __init swapmonfs_init(void) {
 	if (!ret) {
 		printk("swapmon: rdma connection established successfully\n");
 	}
+
+	hash_init(rmem_map);
 
 	frontswap_register_ops(&swapmon_fs_ops);
 	printk("swapmon: registered frontswap ops\n");
