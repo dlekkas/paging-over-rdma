@@ -24,7 +24,7 @@
 #define IBV_DEFAULT_PKEY_FULL 0xFFFF
 
 // Memory size allocated for remote peers.
-constexpr std::size_t BUFFER_SIZE(16 * 4096);
+constexpr std::size_t BUFFER_SIZE(4096 * 4096);
 
 // Completion Queue (CQ) will contain at least `MIN_CQE` entries.
 constexpr int MIN_CQE(8192);
@@ -75,6 +75,10 @@ class ServerRDMA {
 
 	int WaitForClients(int n_clients);
 
+	// Polls for `timeout_s` seconds and returns the total number of
+	// work completions that were observed.
+	int Poll(int timeout_s);
+
 	int InitUDP();
 
 
@@ -103,6 +107,8 @@ class ServerRDMA {
 	void init_mcast_rdma_resources();
 
 	int extract_pkey_index(uint8_t port_num, __be16 pkey);
+
+	int post_page_recv_requests(struct ibv_qp *qp, int num_reqs);
 
 	// Event channel used to report communication events.
 	struct rdma_event_channel *ev_channel_;
@@ -787,17 +793,94 @@ int ServerRDMA::WaitForClients(int n_clients) {
 			return -1;
 		}
 		std::cout << "Received mcast message with wr_id = " << wc.wr_id << "\n";
-		std::cout << "Message = " << &mcast_msg[sizeof(struct ibv_grh)] << std::endl;
+		std::cout << "Message = " << &mcast_msg[sizeof(struct ibv_grh)] << "\n";
 	}
-
-	/*
-	struct ibv_wc wc;
-	while (!ibv_poll_cq(mcast_cq_, 1, &wc)) {
-		// nothing
-	}
-	*/
 
 	return n_conns_;
+}
+
+int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
+	struct ibv_sge sge[2];
+
+	// Here, we allocate some memory to store the GRH header of incoming
+	// multicast messages. `ibv_alloc_null_mr` is only supported in MLX5
+	// so we have to register some "null" memory regions ourselves.
+	void* grh_sink = malloc(sizeof(struct ibv_grh));
+
+	struct ibv_mr *grh_mr;
+	grh_mr = ibv_reg_mr(pd_, grh_sink, sizeof(struct ibv_grh),
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+	if (!grh_mr) {
+		std::cerr << "ibv_reg_mr for GRH headers failed.\n";
+		return -1;
+	}
+
+	// sge for keeping the GRH
+	sge[0].addr = reinterpret_cast<uint64_t>(grh_mr->addr);
+	sge[0].length = sizeof(struct ibv_grh);
+	sge[0].lkey = grh_mr->lkey;
+
+	int max_wrs = BUFFER_SIZE / 4096;
+
+	struct ibv_recv_wr wr, *bad_wr;
+	for (int i = 0; i < std::min(n_wrs, max_wrs); i++) {
+		uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) + i * 4096;
+		// sge for storing the remote page
+		sge[1].addr = page_addr;
+		sge[1].length = 4096;
+		sge[1].lkey = mr_->lkey;
+
+		wr.wr_id = page_addr;
+		wr.next = NULL;
+		wr.sg_list = sge;
+		wr.num_sge = 2;
+		int ret = ibv_post_recv(qp, &wr, &bad_wr);
+		if (ret) {
+			std::cerr << "ibv_post_recv for page failed.\n";
+			return i;
+		}
+	}
+
+	return n_wrs;
+}
+
+int ServerRDMA::Poll(int timeout_s) {
+	auto end = std::chrono::system_clock::now() +
+		std::chrono::seconds(timeout_s);
+
+	struct ibv_device_attr dev_attr;
+	if (ibv_query_device(pd_->context, &dev_attr)) {
+		std::cerr << "ibv_query_device() failed: " << std::strerror(errno) << "\n";
+		return -1;
+	}
+	std::cout << "max RRs = " << dev_attr.max_qp_wr << "\n";
+
+	// Post as many RRs in the work queue as possible in order to avoid doing it
+	// when flooded by incoming pages.
+	// TODO(dimlek): remove -3 once everything works as expected.
+	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr-3);
+	// int succ_posts = post_page_recv_requests(mcast_qp_, 1);
+
+	// Loop until timeout and poll for work completions (i.e. received pages).
+	while (std::chrono::system_clock::now() <= end) {
+		struct ibv_wc wc;
+		int n_wrs = ibv_poll_cq(mcast_cq_, 1, &wc);
+		for (auto i = 0; i < n_wrs; i++) {
+			if (!(wc.opcode & IBV_WC_SEND)) {
+				break;
+			}
+			if (wc.qp_num != mcast_qp_->qp_num) {
+				std::cerr << "wrong qpn in multicast cq.\n";
+				break;
+			}
+			if (wc.status == IBV_WC_SUCCESS) {
+				uint64_t page_store_addr;
+				std::cout << "remote page stored at addr = " << wc.wr_id << "\n";
+			}
+		}
+	}
+
+	return 0;
 }
 
 
@@ -845,9 +928,8 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Pausing for 20sec." << std::endl;
-	std::chrono::milliseconds pause_tm(20000);
-	std::this_thread::sleep_for(pause_tm);
+	std::cout << "Polling for 60sec." << std::endl;
+	server.Poll(60);
 
 	return 0;
 }

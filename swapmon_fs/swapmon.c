@@ -258,6 +258,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	pr_info("starting post_recv_page_ack_msg");
 	post_recv_page_ack_msg(offset, &rmem_info->remote_addr);
 
+	/*
 	ret = swapmon_mcast_send(dma_addr, PAGE_SIZE);
 	if (ret) {
 		pr_err("%s() failed.\n", __func__);
@@ -283,6 +284,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 			done = true;
 		}
 	}
+	*/
 
 	u64 addr = find_page_remote_addr(offset);
 	pr_info("remote addr = %llu\n", addr);
@@ -560,7 +562,6 @@ static int str_to_ib_sockaddr(char *dst, struct sockaddr_ib *mcast_addr) {
 	return 0;
 }
 
-// TODO(dimlek): generates a unique Multicast address which will be transferred
 static int mcast_logic(void) {
 	struct ib_qp_init_attr init_attr;
 	int ret;
@@ -831,9 +832,9 @@ static int send_dummy_mcast_msg(void) {
 	ud_wr.wr.wr_id = 420;
 	ud_wr.wr.sg_list = &sg;
 	ud_wr.wr.num_sge = 1;
-	ud_wr.wr.opcode = IB_WR_SEND_WITH_IMM;
+	ud_wr.wr.opcode = IB_WR_SEND; //_WITH_IMM;
 	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
-	ud_wr.wr.ex.imm_data = htonl(ctrl->mcast_qp->qp_num);
+	// ud_wr.wr.ex.imm_data = htonl(ctrl->mcast_qp->qp_num);
 
 	ud_wr.ah = ctrl->mcast_ah;
 	ud_wr.remote_qpn = ctrl->remote_mcast_qpn;
@@ -1114,6 +1115,7 @@ static int post_recv_control_msg(int num_recvs) {
 // the client to the server.
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event) {
+	struct ib_port_attr port_attr;
 	int ret;
 	int cm_error = 0;
 	printk("rdma_cm_event_handler msg: %s (%d) status %d id $%p\n",
@@ -1127,6 +1129,17 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 			cm_error = swapmon_rdma_route_resolved();
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
+			ret = ib_query_port(ctrl->dev, ctrl->cm_id->port_num, &port_attr);
+			if (ret) {
+				pr_err("ib_query_port failed to query port_num = %u\n",
+						ctrl->cm_id->port_num);
+			}
+			if (port_attr.active_mtu != IB_MTU_4096) {
+				pr_err("port_num = %u needs active MTU = %u (current MTU = %u)",
+						ctrl->cm_id->port_num, ib_mtu_enum_to_int(IB_MTU_4096),
+						ib_mtu_enum_to_int(port_attr.active_mtu));
+			}
+
 			pr_info("connection established successfully\n");
 			// Wait to receive memory info to retrieve all required info to properly
 			// reference remote memory.
@@ -1321,7 +1334,7 @@ static int __init swapmonfs_init(void) {
 
 	hash_init(rmem_map);
 
-	frontswap_register_ops(&swapmon_fs_ops);
+	// frontswap_register_ops(&swapmon_fs_ops);
 	printk("swapmon: registered frontswap ops\n");
 	printk("swapmon: module loaded successfully.\n");
 	return 0;
