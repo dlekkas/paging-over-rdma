@@ -605,10 +605,10 @@ void ServerRDMA::init_mcast_rdma_resources() {
 	attr.send_cq = mcast_cq_;
 	attr.recv_cq = mcast_cq_;
 	attr.srq = NULL;
-	attr.cap.max_send_wr = 6;
-	attr.cap.max_recv_wr = 6;
-	attr.cap.max_send_sge = 1;
-	attr.cap.max_recv_sge = 1;
+	attr.cap.max_send_wr = 0;
+	attr.cap.max_recv_wr = 8192;
+	attr.cap.max_send_sge = 0;
+	attr.cap.max_recv_sge = 2;
 	attr.cap.max_inline_data = 16;
 	attr.qp_type = IBV_QPT_UD;
 	attr.sq_sig_all = 0;
@@ -832,7 +832,7 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 
 		wr.wr_id = page_addr;
 		wr.next = NULL;
-		wr.sg_list = sge;
+		wr.sg_list = &sge[0];
 		wr.num_sge = 2;
 		int ret = ibv_post_recv(qp, &wr, &bad_wr);
 		if (ret) {
@@ -857,29 +857,32 @@ int ServerRDMA::Poll(int timeout_s) {
 
 	// Post as many RRs in the work queue as possible in order to avoid doing it
 	// when flooded by incoming pages.
-	// TODO(dimlek): remove -3 once everything works as expected.
-	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr-3);
-	// int succ_posts = post_page_recv_requests(mcast_qp_, 1);
+	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr);
+	int succ_posts = post_page_recv_requests(mcast_qp_, 5);
+	std::cout << "Posted " << succ_posts << " RRs for pages.\n";
 
 	// Loop until timeout and poll for work completions (i.e. received pages).
 	while (std::chrono::system_clock::now() <= end) {
 		struct ibv_wc wc;
 		int n_wrs = ibv_poll_cq(mcast_cq_, 1, &wc);
 		for (auto i = 0; i < n_wrs; i++) {
-			if (!(wc.opcode & IBV_WC_SEND)) {
+			if (!(wc.opcode & IBV_WC_RECV)) {
 				break;
 			}
 			if (wc.qp_num != mcast_qp_->qp_num) {
-				std::cerr << "wrong qpn in multicast cq.\n";
+				std::cerr << "Wrong qpn in multicast cq.\n";
 				break;
 			}
 			if (wc.status == IBV_WC_SUCCESS) {
+				std::cout << "Successfully received remote page.\n";
 				uint64_t page_store_addr;
-				std::cout << "remote page stored at addr = " << wc.wr_id << "\n";
+				if (wc.wc_flags & IBV_WC_WITH_IMM) {
+					std::cout << "Remote page with id = " << ntohl(wc.imm_data) <<
+						" stored at addr = " << wc.wr_id << "\n";
+				}
 			}
 		}
 	}
-
 	return 0;
 }
 
@@ -928,8 +931,8 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Polling for 60sec." << std::endl;
-	server.Poll(60);
+	std::cout << "Polling for 20sec." << std::endl;
+	server.Poll(20);
 
 	return 0;
 }

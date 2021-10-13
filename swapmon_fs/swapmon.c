@@ -129,14 +129,26 @@ static void swapmon_init(unsigned swap_type) {
 	printk("swapmon_init(%d)", swap_type);
 }
 
-static int swapmon_mcast_send(u64 dma_addr, size_t size) {
+static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	struct ib_send_wr *bad_wr;
 	struct ib_ud_wr ud_wr;
 	struct ib_sge sge;
+	struct ib_wc wc;
+	u64 dma_addr;
 	int ret;
 
+  dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
+			PAGE_SIZE, DMA_TO_DEVICE);
+	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
+		pr_err("%s: dma mapping error\n", __func__);
+		return -1;
+	}
+
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			PAGE_SIZE, DMA_TO_DEVICE);
+
 	sge.addr = dma_addr;
-	sge.length = size;
+	sge.length = PAGE_SIZE;
 	sge.lkey = ctrl->mcast_pd->local_dma_lkey;
 
 	ud_wr.wr.next = NULL;
@@ -153,7 +165,8 @@ static int swapmon_mcast_send(u64 dma_addr, size_t size) {
 	ud_wr.wr.sg_list = &sge;
 	ud_wr.wr.num_sge = 1;
 	ud_wr.wr.opcode = IB_WR_SEND_WITH_IMM;
-	ud_wr.wr.ex.imm_data = htonl(ctrl->mcast_qp->qp_num);
+	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
+	ud_wr.wr.ex.imm_data = htonl(offset);
 
 	ud_wr.ah = ctrl->mcast_ah;
 	ud_wr.remote_qpn = ctrl->remote_mcast_qpn;
@@ -164,6 +177,17 @@ static int swapmon_mcast_send(u64 dma_addr, size_t size) {
 		pr_err("ib_post_send failed to send page.\n");
 		return ret;
 	}
+
+	while (!ib_poll_cq(ctrl->mcast_qp->send_cq, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IB_WC_SUCCESS) {
+		printk("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc.status), wc.wr_id);
+		return wc.status;
+	}
+	pr_info("sent page to mem server.\n");
 
 	return 0;
 }
@@ -220,9 +244,8 @@ static u64 find_page_remote_addr(pgoff_t offset) {
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	int ret;
-	u64 dma_addr;
-	bool done;
-	int retries;
+	// bool done;
+	// int retries;
 	struct ib_wc wc;
 	struct h_node* rmem_info;
 
@@ -245,26 +268,16 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	// insert element into hash table
 	hash_add(rmem_map, &rmem_info->node, offset);
 
-  dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
-			PAGE_SIZE, DMA_TO_DEVICE);
-	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
-		pr_err("%s: dma mapping error\n", __func__);
-		return -1;
-	}
-
-	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
-			PAGE_SIZE, DMA_TO_DEVICE);
-
 	pr_info("starting post_recv_page_ack_msg");
 	post_recv_page_ack_msg(offset, &rmem_info->remote_addr);
 
-	/*
-	ret = swapmon_mcast_send(dma_addr, PAGE_SIZE);
+	ret = swapmon_mcast_send(page, offset);
 	if (ret) {
 		pr_err("%s() failed.\n", __func__);
 		return -1;
 	}
 
+	/*
 	done = false;
 	retries = 50000;
 	while (!done) {
@@ -1334,7 +1347,7 @@ static int __init swapmonfs_init(void) {
 
 	hash_init(rmem_map);
 
-	// frontswap_register_ops(&swapmon_fs_ops);
+	frontswap_register_ops(&swapmon_fs_ops);
 	printk("swapmon: registered frontswap ops\n");
 	printk("swapmon: module loaded successfully.\n");
 	return 0;
