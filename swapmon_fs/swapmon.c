@@ -31,8 +31,13 @@ enum comm_ctrl_opcode {
 	MCAST_MEMBERSHIP_ACK
 };
 
-struct h_node {
+struct page_info {
 	u64 remote_addr;
+	u32 rkey;
+};
+
+struct page_node {
+	struct page_info info;
 	pgoff_t offset;
 	struct hlist_node node;
 };
@@ -192,24 +197,24 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	return 0;
 }
 
-static int post_recv_page_ack_msg(pgoff_t offset, u64* remote_addr) {
+static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
 	struct ib_recv_wr wr, *bad_wr;
 	struct ib_sge sge;
 	u64 dma_addr;
 	int ret;
 
-	dma_addr = ib_dma_map_single(ctrl->dev, remote_addr,
-			sizeof(u64), DMA_FROM_DEVICE);
+	dma_addr = ib_dma_map_single(ctrl->dev, info,
+			sizeof(struct page_info), DMA_FROM_DEVICE);
 	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
 		pr_err("dma address mapping error.\n");
 		return -1;
 	}
 
 	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
-			sizeof(u64), DMA_FROM_DEVICE);
+			sizeof(struct page_info), DMA_FROM_DEVICE);
 
 	sge.addr = dma_addr;
-	sge.length = sizeof(u64);
+	sge.length = sizeof(struct page_info);
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
 	wr.next = NULL;
@@ -230,11 +235,11 @@ static int post_recv_page_ack_msg(pgoff_t offset, u64* remote_addr) {
 // TODO(dimlek): here we should also consider the `swap_type`, since
 // we may have several.
 static u64 find_page_remote_addr(pgoff_t offset) {
-	struct h_node *curr;
+	struct page_node *curr;
 	hash_for_each_possible(rmem_map, curr, node, offset) {
 		if (curr->offset == offset) {
 			pr_info("hash table: remote addr for page offset = %lu found.\n", offset);
-			return curr->remote_addr;
+			return curr->info.remote_addr;
 		}
 	}
 	pr_info("hash table: did not found remote addr for offset = %lu.\n", offset);
@@ -244,10 +249,11 @@ static u64 find_page_remote_addr(pgoff_t offset) {
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	int ret;
-	// bool done;
-	// int retries;
+	u64 addr;
+	bool done;
+	int retries;
 	struct ib_wc wc;
-	struct h_node* rmem_info;
+	struct page_node* rmem_info;
 
 	if (do_not_run) {
 		return -1;
@@ -269,7 +275,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	hash_add(rmem_map, &rmem_info->node, offset);
 
 	pr_info("starting post_recv_page_ack_msg");
-	post_recv_page_ack_msg(offset, &rmem_info->remote_addr);
+	post_recv_page_ack_msg(offset, &rmem_info->info);
 
 	ret = swapmon_mcast_send(page, offset);
 	if (ret) {
@@ -277,7 +283,6 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
-	/*
 	done = false;
 	retries = 50000;
 	while (!done) {
@@ -297,10 +302,9 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 			done = true;
 		}
 	}
-	*/
 
-	u64 addr = find_page_remote_addr(offset);
-	pr_info("remote addr = %llu\n", addr);
+	addr = find_page_remote_addr(offset);
+	pr_info("page stored at remote addr = %llu\n", addr);
 
 	return -1;
 }
@@ -711,6 +715,8 @@ static int init_ud_comms(void) {
 	struct ib_qp_attr qp_attr;
 	struct ib_qp_init_attr qp_init_attr = {};
 	struct rdma_ah_attr ah_attr;
+	union ib_gid sgid;
+	u16 sgid_index;
 	int ret;
 
 	qp_init_attr.send_cq = ctrl->cq;
@@ -770,8 +776,7 @@ static int init_ud_comms(void) {
 	}
 	pr_info("UD QP is in RTS state.\n");
 
-	u16 sgid_index;
-	union ib_gid sgid = ctrl->cm_id->route.path_rec->sgid;
+	sgid = ctrl->cm_id->route.path_rec->sgid;
 	ret = ib_find_gid(ctrl->dev, &sgid, IB_GID_TYPE_IB, NULL,
 			&ctrl->cm_id->port_num, &sgid_index);
 	if (ret) {

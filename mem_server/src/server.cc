@@ -106,6 +106,8 @@ class ServerRDMA {
 
 	void init_mcast_rdma_resources();
 
+	void send_ack(uint64_t addr, uint32_t rkey);
+
 	int extract_pkey_index(uint8_t port_num, __be16 pkey);
 
 	int post_page_recv_requests(struct ibv_qp *qp, int num_reqs);
@@ -844,6 +846,49 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 	return n_wrs;
 }
 
+void ServerRDMA::send_ack(uint64_t addr, uint32_t rkey) {
+	struct {
+		uint64_t addr;
+		uint32_t key;
+	} page_info_msg;
+
+	page_info_msg.addr = addr;
+	page_info_msg.key = rkey;
+
+	struct ibv_sge sge;
+	sge.addr = reinterpret_cast<uint64_t>(&page_info_msg);
+	sge.length = sizeof(page_info_msg);
+	sge.lkey = mr_->lkey;
+
+	struct ibv_send_wr wr, *bad_wr;
+	wr.wr_id = 69;
+	wr.next = NULL;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.opcode = IBV_WR_SEND; // _WITH_IMM;
+	wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+	// wr.imm_data = htonl(op);
+
+	if (ibv_post_send(rc_qp_, &wr, &bad_wr)) {
+		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
+		return;
+	}
+
+	struct ibv_wc wc;
+	int timeout_ms = 10000;
+	int ret = poll_cq_with_timeout(rc_qp_->send_cq, 1, &wc, timeout_ms);
+
+	if (ret <= 0) {
+		std::cout << "Failure when sending ack for page.\n";
+		return;
+	}
+
+	if (wc.status != IBV_WC_SUCCESS) {
+		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
+							<< ", work request ID: " << wc.wr_id << std::endl;
+	}
+}
+
 int ServerRDMA::Poll(int timeout_s) {
 	auto end = std::chrono::system_clock::now() +
 		std::chrono::seconds(timeout_s);
@@ -875,10 +920,11 @@ int ServerRDMA::Poll(int timeout_s) {
 			}
 			if (wc.status == IBV_WC_SUCCESS) {
 				std::cout << "Successfully received remote page.\n";
-				uint64_t page_store_addr;
+				uint64_t page_store_addr = wc.wr_id;
 				if (wc.wc_flags & IBV_WC_WITH_IMM) {
 					std::cout << "Remote page with id = " << ntohl(wc.imm_data) <<
-						" stored at addr = " << wc.wr_id << "\n";
+						" stored at addr = " << page_store_addr << "\n";
+					send_ack(page_store_addr, mr_->rkey);
 				}
 			}
 		}
