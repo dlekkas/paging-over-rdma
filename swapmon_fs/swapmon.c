@@ -234,26 +234,26 @@ static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
 
 // TODO(dimlek): here we should also consider the `swap_type`, since
 // we may have several.
-static u64 find_page_remote_addr(pgoff_t offset) {
+static struct page_info* find_page_remote_info(pgoff_t offset) {
 	struct page_node *curr;
 	hash_for_each_possible(rmem_map, curr, node, offset) {
 		if (curr->offset == offset) {
 			pr_info("hash table: remote addr for page offset = %lu found.\n", offset);
-			return curr->info.remote_addr;
+			return &curr->info;
 		}
 	}
-	pr_info("hash table: did not found remote addr for offset = %lu.\n", offset);
+	pr_info("hash table: did not found remote info for offset = %lu.\n", offset);
 	return 0;
 }
 
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	int ret;
-	u64 addr;
 	bool done;
 	int retries;
 	struct ib_wc wc;
-	struct page_node* rmem_info;
+	struct page_node* rmem_node;
+	struct page_info* info;
 
 	if (do_not_run) {
 		return -1;
@@ -264,18 +264,17 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	printk("swapmon: store(swap_type = %-10u, offset = %lu)\n",
 				 swap_type, offset);
 
-	rmem_info = kzalloc(sizeof(*rmem_info), GFP_KERNEL);
-	if (unlikely(!rmem_info)) {
+	rmem_node = kzalloc(sizeof(*rmem_node), GFP_KERNEL);
+	if (unlikely(!rmem_node)) {
 		pr_err("kzalloc failed to allocate mem for u64.\n");
 		return -ENOMEM;
 	}
-	rmem_info->offset = offset;
+	rmem_node->offset = offset;
 
 	// insert element into hash table
-	hash_add(rmem_map, &rmem_info->node, offset);
+	hash_add(rmem_map, &rmem_node->node, offset);
 
-	pr_info("starting post_recv_page_ack_msg");
-	post_recv_page_ack_msg(offset, &rmem_info->info);
+	post_recv_page_ack_msg(offset, &rmem_node->info);
 
 	ret = swapmon_mcast_send(page, offset);
 	if (ret) {
@@ -303,21 +302,84 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		}
 	}
 
-	addr = find_page_remote_addr(offset);
-	pr_info("page stored at remote addr = %llu\n", addr);
+	info = find_page_remote_info(offset);
+	pr_info("page stored at remote addr = %llu with rkey = %u\n",
+			info->remote_addr, info->rkey);
 
-	return -1;
+	return 0;
+}
+
+static int swapmon_rdma_read(struct page *page, struct page_info *info) {
+	struct ib_send_wr *bad_send_wr;
+	struct ib_rdma_wr rdma_wr;
+	struct ib_sge sge;
+	struct ib_wc wc;
+	u64 dma_addr;
+	int ret;
+
+  dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
+			PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
+		pr_err("%s: dma mapping error\n", __func__);
+		return -1;
+	}
+
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			PAGE_SIZE, DMA_BIDIRECTIONAL);
+
+	sge.addr = dma_addr;
+	sge.length = PAGE_SIZE;
+	sge.lkey = ctrl->pd->local_dma_lkey;
+
+	rdma_wr.wr.wr_id = 2222;
+	rdma_wr.wr.next = NULL;
+	rdma_wr.wr.sg_list = &sge;
+	rdma_wr.wr.num_sge = 1;
+	rdma_wr.wr.opcode = IB_WR_RDMA_READ;
+	rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+
+	rdma_wr.remote_addr = info->remote_addr;
+	rdma_wr.rkey = info->rkey;
+
+	ret = ib_post_send(ctrl->qp, &rdma_wr.wr, &bad_send_wr);
+	if (ret) {
+		pr_err("ib_post_send failed to read remote page.\n");
+		return ret;
+	}
+
+	while (!ib_poll_cq(ctrl->qp->recv_cq, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IB_WC_SUCCESS) {
+		printk("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc.status), wc.wr_id);
+		return wc.status;
+	}
+	pr_info("received page from mem server.\n");
+	return 0;
 }
 
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
-	u64 rmem_addr;
-	rmem_addr = find_page_remote_addr(offset);
+	struct page_info *info;
+	int ret;
 
-	printk("swapmon: load(swap_type = %-10u, offset = %lu)\n",
+	pr_info("swapmon: load(swap_type = %-10u, offset = %lu)\n",
 				 swap_type, offset);
 
-	return -1;
+	info = find_page_remote_info(offset);
+	pr_info("retrieved remote page info: remote_addr = %llu, rkey = %u\n",
+			info->remote_addr, info->rkey);
+
+	ret = swapmon_rdma_read(page, info);
+	if (ret) {
+		pr_info("failed to fetch remote page.\n");
+		return -1;
+	}
+
+	pr_info("successfully fetched remote page.\n");
+	return 0;
 }
 
 static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
