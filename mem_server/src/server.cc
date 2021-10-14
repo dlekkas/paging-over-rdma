@@ -106,7 +106,7 @@ class ServerRDMA {
 
 	void init_mcast_rdma_resources();
 
-	void send_ack(uint64_t addr, uint32_t rkey);
+	void send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey);
 
 	int extract_pkey_index(uint8_t port_num, __be16 pkey);
 
@@ -578,6 +578,8 @@ void ServerRDMA::init_mcast_rdma_resources() {
 		// std::exit(EXIT_FAILURE);
 	}
 
+	std::cout << "mcast CQE = " << mcast_cq_->cqe << "\n";
+
 	/*
 	std::string ip("192.168.1.20");
 	struct rdma_addrinfo hints;
@@ -846,7 +848,7 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 	return n_wrs;
 }
 
-void ServerRDMA::send_ack(uint64_t addr, uint32_t rkey) {
+void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 	struct {
 		uint64_t addr;
 		uint32_t key;
@@ -865,9 +867,9 @@ void ServerRDMA::send_ack(uint64_t addr, uint32_t rkey) {
 	wr.next = NULL;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
-	wr.opcode = IBV_WR_SEND; // _WITH_IMM;
+	wr.opcode = IBV_WR_SEND_WITH_IMM;
 	wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-	// wr.imm_data = htonl(op);
+	wr.imm_data = htonl(page_id);
 
 	if (ibv_post_send(rc_qp_, &wr, &bad_wr)) {
 		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
@@ -876,12 +878,18 @@ void ServerRDMA::send_ack(uint64_t addr, uint32_t rkey) {
 
 	struct ibv_wc wc;
 	int timeout_ms = 10000;
-	int ret = poll_cq_with_timeout(rc_qp_->send_cq, 1, &wc, timeout_ms);
+	// int ret = poll_cq_with_timeout(rc_qp_->send_cq, 1, &wc, timeout_ms);
 
+	while (!ibv_poll_cq(cq_, 1, &wc)) {
+		// nothing
+	}
+
+	/*
 	if (ret <= 0) {
 		std::cout << "Failure when sending ack for page.\n";
 		return;
 	}
+	*/
 
 	if (wc.status != IBV_WC_SUCCESS) {
 		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
@@ -903,7 +911,7 @@ int ServerRDMA::Poll(int timeout_s) {
 	// Post as many RRs in the work queue as possible in order to avoid doing it
 	// when flooded by incoming pages.
 	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr);
-	int succ_posts = post_page_recv_requests(mcast_qp_, 5);
+	int succ_posts = post_page_recv_requests(mcast_qp_, 128);
 	std::cout << "Posted " << succ_posts << " RRs for pages.\n";
 
 	// Loop until timeout and poll for work completions (i.e. received pages).
@@ -921,10 +929,11 @@ int ServerRDMA::Poll(int timeout_s) {
 			if (wc.status == IBV_WC_SUCCESS) {
 				std::cout << "Successfully received remote page.\n";
 				uint64_t page_store_addr = wc.wr_id;
+				uint32_t page_id = ntohl(wc.imm_data);
 				if (wc.wc_flags & IBV_WC_WITH_IMM) {
-					std::cout << "Remote page with id = " << ntohl(wc.imm_data) <<
+					std::cout << "Remote page with id = " << page_id <<
 						" stored at addr = " << page_store_addr << "\n";
-					send_ack(page_store_addr, mr_->rkey);
+					send_ack(page_id, page_store_addr, mr_->rkey);
 				}
 			}
 		}

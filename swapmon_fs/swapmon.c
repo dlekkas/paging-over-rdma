@@ -19,10 +19,12 @@
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
 #define UC_QKEY 0x11111111
 
-int do_not_run = 0;
+int page_cnt = 0;
 
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
+
+static struct page_info* find_page_remote_info(pgoff_t offset);
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
 
@@ -192,9 +194,28 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 					 ib_wc_status_msg(wc.status), wc.wr_id);
 		return wc.status;
 	}
-	pr_info("sent page to mem server.\n");
 
 	return 0;
+}
+
+static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
+	struct page_info *info;
+	pgoff_t offset;
+	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+		pr_err("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc->status), wc->wr_id);
+		return;
+	}
+
+	if (unlikely(!(wc->wc_flags & IB_WC_WITH_IMM))) {
+		pr_err("ACK message doesn't contain immediate data.\n");
+		return;
+	}
+
+	offset = ntohl(wc->ex.imm_data);
+	info = find_page_remote_info(offset);
+	pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
+			page_cnt, offset, info->remote_addr, info->rkey);
 }
 
 static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
@@ -205,7 +226,7 @@ static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
 
 	dma_addr = ib_dma_map_single(ctrl->dev, info,
 			sizeof(struct page_info), DMA_FROM_DEVICE);
-	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
 		pr_err("dma address mapping error.\n");
 		return -1;
 	}
@@ -217,8 +238,15 @@ static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
 	sge.length = sizeof(struct page_info);
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
+	wr.wr_cqe = (struct ib_cqe *)
+		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
+	if (unlikely(!wr.wr_cqe)) {
+		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
+		return -ENOMEM;
+	}
+	wr.wr_cqe->done = page_ack_done;
 	wr.next = NULL;
-	wr.wr_id = offset;
+	// wr.wr_id = offset;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 
@@ -255,14 +283,15 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	struct page_node* rmem_node;
 	struct page_info* info;
 
-	if (do_not_run) {
+	// run for 32 pages
+	if (page_cnt >= 32) {
 		return -1;
 	} else {
-		do_not_run = 1;
+		page_cnt++;
 	}
 
-	printk("swapmon: store(swap_type = %-10u, offset = %lu)\n",
-				 swap_type, offset);
+	printk("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
+				 page_cnt, swap_type, offset);
 
 	rmem_node = kzalloc(sizeof(*rmem_node), GFP_KERNEL);
 	if (unlikely(!rmem_node)) {
@@ -271,42 +300,47 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	}
 	rmem_node->offset = offset;
 
-	// insert element into hash table
+	// insert offset to remote addr mapping into hash table
 	hash_add(rmem_map, &rmem_node->node, offset);
 
-	post_recv_page_ack_msg(offset, &rmem_node->info);
-
-	ret = swapmon_mcast_send(page, offset);
+	// post RR for the ACK message to be received from mem server
+	ret = post_recv_page_ack_msg(offset, &rmem_node->info);
 	if (ret) {
-		pr_err("%s() failed.\n", __func__);
+		pr_err("post_recv_page_ack_msg failed.\n");
 		return -1;
 	}
 
-	done = false;
-	retries = 50000;
-	while (!done) {
+	// multicast the physical page to the memory servers
+	ret = swapmon_mcast_send(page, offset);
+	if (ret) {
+		pr_err("swapmon_mcast_send() failed.\n");
+		return -1;
+	}
+
+	/*
+	while (true) {
 		ret = ib_poll_cq(ctrl->cq, 1, &wc);
-		if (ret > 0) {
+		if (ret < 0) {
+			pr_err("polling failed.\n");
+			break;
+		} else if (ret > 0) {
 			if (wc.status != IB_WC_SUCCESS) {
-				pr_err("Polling failed with status %s " "(work request ID = %llu).\n",
-						ib_wc_status_msg(wc.status), wc.wr_id);
-				return -1;
+				printk("Polling failed with status %s (work request ID = %llu).\n",
+							 ib_wc_status_msg(wc.status), wc.wr_id);
+				return wc.status;
 			} else if (wc.wr_id == offset) {
-				pr_info("successfully received page ACK.\n");
-				done = true;
+				pr_info("received ACK for page %lu\n", offset);
+				break;
 			}
-		}
-		retries--;
-		if (retries <= 0) {
-			done = true;
 		}
 	}
 
 	info = find_page_remote_info(offset);
-	pr_info("page stored at remote addr = %llu with rkey = %u\n",
-			info->remote_addr, info->rkey);
+	pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
+			page_cnt, offset, info->remote_addr, info->rkey);
+	*/
 
-	return 0;
+	return -1;
 }
 
 static int swapmon_rdma_read(struct page *page, struct page_info *info) {
@@ -356,7 +390,7 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 					 ib_wc_status_msg(wc.status), wc.wr_id);
 		return wc.status;
 	}
-	pr_info("received page from mem server.\n");
+
 	return 0;
 }
 
@@ -365,12 +399,10 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	struct page_info *info;
 	int ret;
 
-	pr_info("swapmon: load(swap_type = %-10u, offset = %lu)\n",
+	pr_info("swapmon: load(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
 
 	info = find_page_remote_info(offset);
-	pr_info("retrieved remote page info: remote_addr = %llu, rkey = %u\n",
-			info->remote_addr, info->rkey);
 
 	ret = swapmon_rdma_read(page, info);
 	if (ret) {
@@ -378,17 +410,18 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
-	pr_info("successfully fetched remote page.\n");
+	pr_info("swapmon: page %lu loaded from: remote addr = %llu, rkey = %u\n",
+			offset, info->remote_addr, info->rkey);
 	return 0;
 }
 
 static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
-	printk("swapmon: invalidate_page(swap_type = %-10u, offset = %lu)\n",
+	printk("swapmon: invalidate_page(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
 }
 
 static void swapmon_invalidate_area(unsigned swap_type) {
-	printk("swapmon: invalidate_area(swap_type = %-10u)\n", swap_type);
+	printk("swapmon: invalidate_area(swap_type = %u)\n", swap_type);
 }
 
 static struct frontswap_ops swapmon_fs_ops = {
@@ -444,9 +477,6 @@ module_param_named(sport, server_port, int, 0644);
 MODULE_PARM_DESC(server_port, "Port number that memory servers"
 		" are listening on");
 
-//static char server_ip[INET_ADDRSTRLEN];
-//module_param_string(sip, server_ip, INET_ADDRSTRLEN, 0644);
-
 static char client_ip[INET_ADDRSTRLEN];
 module_param_string(cip, client_ip, INET_ADDRSTRLEN, 0644);
 MODULE_PARM_DESC(client_ip, "IP address in n.n.n.n form of the interface used"
@@ -498,7 +528,7 @@ static int swapmon_rdma_create_qp(const int factor) {
 	/* +1 for drain */
 	init_attr.cap.max_send_wr = factor * ctrl->queue_size + 1;
 	/* +1 for drain */
-	init_attr.cap.max_recv_wr = ctrl->queue_size + 1;
+	init_attr.cap.max_recv_wr = ctrl->queue_size + 64;
 	init_attr.cap.max_recv_sge = 1;
 	init_attr.cap.max_send_sge = 1;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
@@ -691,9 +721,9 @@ static int mcast_logic(void) {
 	memset(&init_attr, 0, sizeof(init_attr));
 	init_attr.event_handler = swapmon_rdma_qp_event;
 	init_attr.cap.max_send_wr = 20;
-	init_attr.cap.max_recv_wr = 20;
-	init_attr.cap.max_recv_sge = 1;
 	init_attr.cap.max_send_sge = 1;
+	init_attr.cap.max_recv_wr = 0;
+	init_attr.cap.max_recv_sge = 0;
 	init_attr.sq_sig_type = IB_SIGNAL_ALL_WR;
 	init_attr.qp_type = IB_QPT_UD;
 	init_attr.send_cq = ctrl->mcast_cq;
