@@ -1,3 +1,25 @@
+/*
+ * swapmon.c - swapping over RDMA driver
+ *
+ * swapmon is a backend for frontswap that intercepts pages in the
+ * process of being swapped out to disk and attempts to send them
+ * to a remote memory server through Infiniband. The pages are written
+ * to a set of memory servers through multicast and are later read
+ * through RDMA read operation.
+ *
+ * Copyright (C) 2021 Dimitris Lekkas <dilekkas@student.net.ethz.ch>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 3
+ * of the License, or any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
 #include <linux/module.h>
 #include <linux/frontswap.h>
 #include <linux/vmalloc.h>
@@ -14,6 +36,7 @@
 
 #include <linux/init.h>
 #include <linux/hashtable.h>
+#include <linux/rbtree.h>
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
@@ -24,7 +47,9 @@ int page_cnt = 0;
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
 
-static struct page_info* find_page_remote_info(pgoff_t offset);
+// static struct page_info* find_page_remote_info(pgoff_t offset);
+
+static struct rb_root mcswap_tree = RB_ROOT;
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
 
@@ -38,6 +63,54 @@ struct page_info {
 	u32 rkey;
 };
 
+struct mcswap_entry {
+	struct rb_node node;
+	pgoff_t offset;
+	struct page_info info;
+};
+
+static struct mcswap_entry* rb_find_page_remote_info(
+		struct rb_root *root, pgoff_t offset) {
+	struct rb_node *node = root->rb_node;
+	struct mcswap_entry *entry;
+
+	while (node) {
+		entry = container_of(node, struct mcswap_entry, node);
+		if (entry->offset > offset) {
+			node = node->rb_left;
+		} else if (entry->offset < offset) {
+			node = node->rb_right;
+		} else {
+			return entry;
+		}
+	}
+	return NULL;
+}
+
+static int mcswap_rb_insert(struct rb_root *root,
+		struct mcswap_entry *data) {
+	struct rb_node **new = &root->rb_node;
+	struct rb_node *parent = NULL;
+	struct mcswap_entry *entry;
+
+	while (*new) {
+		entry = container_of(*new, struct mcswap_entry, node);
+		parent = *new;
+		if (entry->offset > data->offset) {
+			new = &((*new)->rb_left);
+		} else if (entry->offset < data->offset) {
+			new = &((*new)->rb_right);
+		} else {
+			return -1;
+		}
+	}
+
+	// add new node and rebalance red-black tree
+	rb_link_node(&data->node, parent, new);
+	rb_insert_color(&data->node, root);
+	return 0;
+}
+
 struct page_node {
 	struct page_info info;
 	pgoff_t offset;
@@ -45,7 +118,7 @@ struct page_node {
 };
 
 // up to 2^10 = 1024 entries
-DECLARE_HASHTABLE(rmem_map, 10);
+// DECLARE_HASHTABLE(rmem_map, 10);
 
 struct mem_info {
 	u64 addr;
@@ -199,7 +272,8 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 }
 
 static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
-	struct page_info *info;
+	struct mcswap_entry *entry;
+	// struct page_info *info;
 	pgoff_t offset;
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
 		pr_err("Polling failed with status %s (work request ID = %llu).\n",
@@ -213,9 +287,10 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 	}
 
 	offset = ntohl(wc->ex.imm_data);
-	info = find_page_remote_info(offset);
+
+	entry = rb_find_page_remote_info(&mcswap_tree, offset);
 	pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
-			page_cnt, offset, info->remote_addr, info->rkey);
+			page_cnt, offset, entry->info.remote_addr, entry->info.rkey);
 }
 
 static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
@@ -262,6 +337,7 @@ static int post_recv_page_ack_msg(pgoff_t offset, struct page_info *info) {
 
 // TODO(dimlek): here we should also consider the `swap_type`, since
 // we may have several.
+/*
 static struct page_info* find_page_remote_info(pgoff_t offset) {
 	struct page_node *curr;
 	hash_for_each_possible(rmem_map, curr, node, offset) {
@@ -273,6 +349,7 @@ static struct page_info* find_page_remote_info(pgoff_t offset) {
 	pr_info("hash table: did not found remote info for offset = %lu.\n", offset);
 	return 0;
 }
+*/
 
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
@@ -280,11 +357,12 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	bool done;
 	int retries;
 	struct ib_wc wc;
-	struct page_node* rmem_node;
+	// struct page_node* rmem_node;
+	struct mcswap_entry* rmem_node;
 	struct page_info* info;
 
 	// run for 32 pages
-	if (page_cnt >= 32) {
+	if (page_cnt >= 8) {
 		return -1;
 	} else {
 		page_cnt++;
@@ -301,7 +379,13 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	rmem_node->offset = offset;
 
 	// insert offset to remote addr mapping into hash table
-	hash_add(rmem_map, &rmem_node->node, offset);
+	// hash_add(rmem_map, &rmem_node->node, offset);
+
+	ret = mcswap_rb_insert(&mcswap_tree, rmem_node);
+	if (ret) {
+		pr_info("failed to insert entry into red-black tree.\n");
+		return -1;
+	}
 
 	// post RR for the ACK message to be received from mem server
 	ret = post_recv_page_ack_msg(offset, &rmem_node->info);
@@ -340,7 +424,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 			page_cnt, offset, info->remote_addr, info->rkey);
 	*/
 
-	return -1;
+	return 0;
 }
 
 static int swapmon_rdma_read(struct page *page, struct page_info *info) {
@@ -396,22 +480,26 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
-	struct page_info *info;
+	// struct page_info *info;
+	struct mcswap_entry *entry;
 	int ret;
 
 	pr_info("swapmon: load(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
 
-	info = find_page_remote_info(offset);
+	// info = find_page_remote_info(offset);
 
-	ret = swapmon_rdma_read(page, info);
+	entry = rb_find_page_remote_info(&mcswap_tree, offset);
+	pr_info("found entry.\n");
+
+	ret = swapmon_rdma_read(page, &entry->info);
 	if (ret) {
 		pr_info("failed to fetch remote page.\n");
 		return -1;
 	}
 
 	pr_info("swapmon: page %lu loaded from: remote addr = %llu, rkey = %u\n",
-			offset, info->remote_addr, info->rkey);
+			offset, entry->info.remote_addr, entry->info.rkey);
 	return 0;
 }
 
@@ -1442,7 +1530,7 @@ static int __init swapmonfs_init(void) {
 		printk("swapmon: rdma connection established successfully\n");
 	}
 
-	hash_init(rmem_map);
+	// hash_init(rmem_map);
 
 	frontswap_register_ops(&swapmon_fs_ops);
 	printk("swapmon: registered frontswap ops\n");
