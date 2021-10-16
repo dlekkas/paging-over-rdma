@@ -50,6 +50,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 // static struct page_info* find_page_remote_info(pgoff_t offset);
 
 static struct rb_root mcswap_tree = RB_ROOT;
+static struct kmem_cache *mcswap_entry_cache;
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
 
@@ -68,6 +69,7 @@ struct mcswap_entry {
 	pgoff_t offset;
 	struct page_info info;
 };
+
 
 static struct mcswap_entry* rb_find_page_remote_info(
 		struct rb_root *root, pgoff_t offset) {
@@ -111,14 +113,22 @@ static int mcswap_rb_insert(struct rb_root *root,
 	return 0;
 }
 
+static int mcswap_rb_erase(struct rb_root *root, pgoff_t offset) {
+	struct mcswap_entry *data;
+	data = rb_find_page_remote_info(root, offset);
+	if (!RB_EMPTY_NODE(&data->node)) {
+		rb_erase(&data->node, root);
+		RB_CLEAR_NODE(&data->node);
+		return 0;
+	}
+	return -1;
+}
+
 struct page_node {
 	struct page_info info;
 	pgoff_t offset;
 	struct hlist_node node;
 };
-
-// up to 2^10 = 1024 entries
-// DECLARE_HASHTABLE(rmem_map, 10);
 
 struct mem_info {
 	u64 addr;
@@ -357,9 +367,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	bool done;
 	int retries;
 	struct ib_wc wc;
-	// struct page_node* rmem_node;
 	struct mcswap_entry* rmem_node;
-	struct page_info* info;
 
 	// run for 32 pages
 	if (page_cnt >= 8) {
@@ -371,18 +379,16 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	printk("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
 				 page_cnt, swap_type, offset);
 
-	rmem_node = kzalloc(sizeof(*rmem_node), GFP_KERNEL);
+	rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
 	if (unlikely(!rmem_node)) {
 		pr_err("kzalloc failed to allocate mem for u64.\n");
 		return -ENOMEM;
 	}
 	rmem_node->offset = offset;
 
-	// insert offset to remote addr mapping into hash table
-	// hash_add(rmem_map, &rmem_node->node, offset);
-
+	// insert offset to remote addr mapping into red-black tree
 	ret = mcswap_rb_insert(&mcswap_tree, rmem_node);
-	if (ret) {
+	if (unlikely(ret)) {
 		pr_info("failed to insert entry into red-black tree.\n");
 		return -1;
 	}
@@ -396,7 +402,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 
 	// multicast the physical page to the memory servers
 	ret = swapmon_mcast_send(page, offset);
-	if (ret) {
+	if (unlikely(ret)) {
 		pr_err("swapmon_mcast_send() failed.\n");
 		return -1;
 	}
@@ -487,13 +493,14 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	pr_info("swapmon: load(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
 
-	// info = find_page_remote_info(offset);
-
 	entry = rb_find_page_remote_info(&mcswap_tree, offset);
-	pr_info("found entry.\n");
+	if (!entry) {
+		pr_err("failed to find page metadata in red-black tree.\n");
+		return -1;
+	}
 
 	ret = swapmon_rdma_read(page, &entry->info);
-	if (ret) {
+	if (unlikely(ret)) {
 		pr_info("failed to fetch remote page.\n");
 		return -1;
 	}
@@ -504,12 +511,28 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 }
 
 static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
+	int ret;
 	printk("swapmon: invalidate_page(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
+
+	ret = mcswap_rb_erase(&mcswap_tree, offset);
+	if (unlikely(ret)) {
+		pr_err("could not erase page with offset = %lu\n", offset);
+		return;
+	}
 }
 
 static void swapmon_invalidate_area(unsigned swap_type) {
-	printk("swapmon: invalidate_area(swap_type = %u)\n", swap_type);
+	struct mcswap_entry *curr, *tmp;
+	pr_info("swapmon: invalidate_area(swap_type = %u)\n", swap_type);
+	rbtree_postorder_for_each_entry_safe(curr, tmp, &mcswap_tree, node) {
+		// TODO(dimlek): the check for empty node might not be needed here.
+		if (!RB_EMPTY_NODE(&curr->node)) {
+			rb_erase(&curr->node, &mcswap_tree);
+			kmem_cache_free(mcswap_entry_cache, curr);
+			RB_CLEAR_NODE(&curr->node);
+		}
+	}
 }
 
 static struct frontswap_ops swapmon_fs_ops = {
@@ -1525,21 +1548,26 @@ err_unreg_client:
 
 static int __init swapmonfs_init(void) {
 	int ret;
-	ret = rdma_conn_init();
-	if (!ret) {
-		printk("swapmon: rdma connection established successfully\n");
+
+	mcswap_entry_cache = KMEM_CACHE(mcswap_entry, 0);
+	if (!mcswap_entry_cache) {
+		pr_err("failed to create slab cache for mcswap entries.\n");
+		return -1;
 	}
 
-	// hash_init(rmem_map);
+	ret = rdma_conn_init();
+	if (!ret) {
+		printk("rdma connection established successfully\n");
+	}
 
 	frontswap_register_ops(&swapmon_fs_ops);
-	printk("swapmon: registered frontswap ops\n");
-	printk("swapmon: module loaded successfully.\n");
+	pr_info("module loaded successfully.\n");
 	return 0;
 }
 
 static void __exit swapmonfs_exit(void) {
-	printk("swapmon: module unloaded\n");
+	kmem_cache_destroy(mcswap_entry_cache);
+	pr_info("module unloaded\n");
 }
 
 module_init(swapmonfs_init);
