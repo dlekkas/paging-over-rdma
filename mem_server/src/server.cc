@@ -314,7 +314,13 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	conn_param.private_data = NULL;
 	conn_param.private_data_len = 0;
 	conn_param.responder_resources = param->responder_resources;
+	if (conn_param.responder_resources == 0) {
+		std::cout << "responder_resources = 0.\n";
+	}
 	conn_param.initiator_depth = param->initiator_depth;
+	if (conn_param.initiator_depth == 0) {
+		std::cout << "initiator_depth = 0.\n";
+	}
 	conn_param.flow_control = param->flow_control;
 	conn_param.rnr_retry_count = param->rnr_retry_count;
 
@@ -876,6 +882,7 @@ void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 		return;
 	}
 
+	/*
 	struct ibv_wc wc;
 	int timeout_ms = 10000;
 	// int ret = poll_cq_with_timeout(rc_qp_->send_cq, 1, &wc, timeout_ms);
@@ -884,17 +891,11 @@ void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 		// nothing
 	}
 
-	/*
-	if (ret <= 0) {
-		std::cout << "Failure when sending ack for page.\n";
-		return;
-	}
-	*/
-
 	if (wc.status != IBV_WC_SUCCESS) {
 		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
 							<< ", work request ID: " << wc.wr_id << std::endl;
 	}
+	*/
 }
 
 int ServerRDMA::Poll(int timeout_s) {
@@ -914,10 +915,14 @@ int ServerRDMA::Poll(int timeout_s) {
 	int succ_posts = post_page_recv_requests(mcast_qp_, 128);
 	std::cout << "Posted " << succ_posts << " RRs for pages.\n";
 
+	int cnt = 0;
 	// Loop until timeout and poll for work completions (i.e. received pages).
 	while (std::chrono::system_clock::now() <= end) {
 		struct ibv_wc wc;
 		int n_wrs = ibv_poll_cq(mcast_cq_, 1, &wc);
+		if (n_wrs < 0) {
+			std::cerr << "issue with ibv_poll_cq().\n";
+		}
 		for (auto i = 0; i < n_wrs; i++) {
 			if (!(wc.opcode & IBV_WC_RECV)) {
 				break;
@@ -927,16 +932,31 @@ int ServerRDMA::Poll(int timeout_s) {
 				break;
 			}
 			if (wc.status == IBV_WC_SUCCESS) {
-				std::cout << "Successfully received remote page.\n";
 				uint64_t page_store_addr = wc.wr_id;
 				uint32_t page_id = ntohl(wc.imm_data);
 				if (wc.wc_flags & IBV_WC_WITH_IMM) {
-					std::cout << "Remote page with id = " << page_id <<
+					cnt++;
+					std::cout << cnt << " Remote page with id = " << page_id <<
 						" stored at addr = " << page_store_addr << "\n";
 					send_ack(page_id, page_store_addr, mr_->rkey);
 				}
+			} else {
+				std::cerr << "Polling failed with status "
+					<< ibv_wc_status_str(wc.status) << ", work request ID: "
+					<< wc.wr_id << std::endl;
+				break;
 			}
 		}
+		int rc_wrs = ibv_poll_cq(cq_, 1, &wc);
+		if (rc_wrs > 0) {
+			if (wc.qp_num != rc_qp_->qp_num) {
+				std::cerr << "wrong qpn.\n";
+				break;
+			}
+			if (wc.status != IBV_WC_SUCCESS) {
+				std::cerr << "ACK message failure.\n";
+			}
+	 	}
 	}
 	return 0;
 }

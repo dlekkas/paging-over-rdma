@@ -47,8 +47,6 @@ int page_cnt = 0;
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
 
-// static struct page_info* find_page_remote_info(pgoff_t offset);
-
 static struct rb_root mcswap_tree = RB_ROOT;
 static struct kmem_cache *mcswap_entry_cache;
 static struct kmem_cache *rdma_req_cache;
@@ -229,7 +227,6 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	struct ib_send_wr *bad_wr;
 	struct ib_ud_wr ud_wr;
 	struct ib_sge sge;
-	struct ib_wc wc;
 	u64 dma_addr;
 	int ret;
 
@@ -248,20 +245,11 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	sge.lkey = ctrl->mcast_pd->local_dma_lkey;
 
 	ud_wr.wr.next = NULL;
-	/*
-	ud_wr.wr.wr_cqe = (struct ib_cqe *)
-		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
-	if (!ud_wr.wr.wr_cqe) {
-		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
-		return -ENOMEM;
-	}
-	ud_wr.wr.wr_cqe->done = send_mcast_page_done;
-	*/
 	ud_wr.wr.wr_id = 1111;
 	ud_wr.wr.sg_list = &sge;
 	ud_wr.wr.num_sge = 1;
 	ud_wr.wr.opcode = IB_WR_SEND_WITH_IMM;
-	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
+	ud_wr.wr.send_flags = 0;
 	ud_wr.wr.ex.imm_data = htonl(offset);
 
 	ud_wr.ah = ctrl->mcast_ah;
@@ -272,16 +260,6 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	if (ret) {
 		pr_err("ib_post_send failed to send page.\n");
 		return ret;
-	}
-
-	while (!ib_poll_cq(ctrl->mcast_qp->send_cq, 1, &wc)) {
-		// nothing
-	}
-
-	if (wc.status != IB_WC_SUCCESS) {
-		printk("Polling failed with status %s (work request ID = %llu).\n",
-					 ib_wc_status_msg(wc.status), wc.wr_id);
-		return wc.status;
 	}
 
 	return 0;
@@ -346,6 +324,7 @@ static int post_recv_page_ack_msg(struct page_ack_req *req) {
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
 	wr.wr_cqe = &req->cqe;
+	// wr.wr_id = req->entry->offset;
 	wr.next = NULL;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
@@ -386,7 +365,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	struct page_ack_req* req;
 
 	// run for 32 pages
-	if (page_cnt >= 8) {
+	if (page_cnt >= 105) {
 		return -1;
 	} else {
 		page_cnt++;
@@ -437,17 +416,44 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 				return wc.status;
 			} else if (wc.wr_id == offset) {
 				pr_info("received ACK for page %lu\n", offset);
+				ret = mcswap_rb_insert(&mcswap_tree, req->entry);
 				break;
 			}
 		}
 	}
 
-	info = find_page_remote_info(offset);
+	struct mcswap_entry *ent;
+	// entry was added to the remote memory mapping, so print logs
+	ent = rb_find_page_remote_info(&mcswap_tree, offset);
+	if (!ent) {
+		pr_info("page was not stored properly.\n");
+		return -1;
+	}
 	pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
-			page_cnt, offset, info->remote_addr, info->rkey);
+			page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
 	*/
 
-	return 0;
+	return -1;
+}
+
+struct hack_s {
+	struct ib_cqe cqe;
+	struct completion req_done;
+};
+
+static void remote_page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
+	struct hack_s *req;
+	pgoff_t offset;
+	int ret;
+
+	req = container_of(wc->wr_cqe, struct hack_s, cqe);
+	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+		pr_err("Polling failed with status: %s.\n",
+					 ib_wc_status_msg(wc->status));
+		complete(&req->req_done);
+		return;
+	}
+	complete(&req->req_done);
 }
 
 static int swapmon_rdma_read(struct page *page, struct page_info *info) {
@@ -472,7 +478,21 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 	sge.length = PAGE_SIZE;
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
-	rdma_wr.wr.wr_id = 2222;
+	struct hack_s hack;
+	init_completion(&hack.req_done);
+	hack.cqe.done = remote_page_read_done;
+
+	/*
+	rdma_wr.wr.wr_cqe = (struct ib_cqe *)
+		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
+	if (!rdma_wr.wr.wr_cqe) {
+		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
+		return -ENOMEM;
+	}
+	*/
+	rdma_wr.wr.wr_cqe = &hack.cqe;
+
+	//rdma_wr.wr.wr_id = 2222;
 	rdma_wr.wr.next = NULL;
 	rdma_wr.wr.sg_list = &sge;
 	rdma_wr.wr.num_sge = 1;
@@ -488,15 +508,39 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 		return ret;
 	}
 
+	//wait_for_completion_interruptible_timeout(&hack.req_done,
+			//msecs_to_jiffies(2000));
+	mdelay(1);
+
+	/*
+	while (1) {
+		ret = ib_poll_cq(ctrl->qp->recv_cq, 1, &wc);
+		if (ret > 0) {
+			if (wc.status != IB_WC_SUCCESS) {
+				pr_info("Polling failed with status %s.\n",
+							 ib_wc_status_msg(wc.status));
+				return wc.status;
+			}
+			if (wc.wr_id != 2222) {
+				pr_err("WARNING: wr_id != 2222.\n");
+				if (wc.wr_cqe) {
+					if (wc.wr_cqe->done == page_ack_done) {
+						wc.wr_cqe->done(ctrl->qp->recv_cq, &wc);
+					}
+				}
+			} else {
+				break;
+			}
+		} else if (ret < 0) {
+			break;
+		}
+	}
+	*/
+	/*
 	while (!ib_poll_cq(ctrl->qp->recv_cq, 1, &wc)) {
 		// nothing
 	}
-
-	if (wc.status != IB_WC_SUCCESS) {
-		printk("Polling failed with status %s (work request ID = %llu).\n",
-					 ib_wc_status_msg(wc.status), wc.wr_id);
-		return wc.status;
-	}
+	*/
 
 	return 0;
 }
@@ -569,6 +613,7 @@ static struct frontswap_ops swapmon_fs_ops = {
 	.invalidate_area = swapmon_invalidate_area,
 };
 
+/*
 static void swapmon_rdma_dev_add(struct ib_device* dev) {
 	printk("swapmon: swapmon_rdma_dev_add()\n");
 }
@@ -576,7 +621,6 @@ static void swapmon_rdma_dev_add(struct ib_device* dev) {
 static void swapmon_rdma_dev_remove(struct ib_device* dev, void *client_data) {
 	printk("swapmon: swapmon_rdma_dev_remove()\n");
 
-	/* delete the controller using this device */
 	mutex_lock(&swapmon_rdma_ctrl_mutex);
 	if (ctrl->dev == dev) {
 		dev_info(&(ctrl->dev->dev), "removing ctrl: addr %pISp\n",
@@ -590,6 +634,7 @@ static struct ib_client swapmon_ib_client = {
 	.add    = swapmon_rdma_dev_add,
 	.remove = swapmon_rdma_dev_remove
 };
+*/
 
 #define MAX_NR_SERVERS 3
 
@@ -848,11 +893,11 @@ static int mcast_logic(void) {
 	// TODO(dimlek): set max_send/recv properly
 	memset(&init_attr, 0, sizeof(init_attr));
 	init_attr.event_handler = swapmon_rdma_qp_event;
-	init_attr.cap.max_send_wr = 20;
+	init_attr.cap.max_send_wr = 128;
 	init_attr.cap.max_send_sge = 1;
 	init_attr.cap.max_recv_wr = 0;
 	init_attr.cap.max_recv_sge = 0;
-	init_attr.sq_sig_type = IB_SIGNAL_ALL_WR;
+	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_UD;
 	init_attr.send_cq = ctrl->mcast_cq;
 	init_attr.recv_cq = ctrl->mcast_cq;
@@ -878,6 +923,7 @@ static int mcast_logic(void) {
 	return 0;
 }
 
+/*
 #define UD_DUMMY_MSG "hello UD world!"
 static int send_dummy_ud_msg(void) {
 	struct ib_ud_wr ud_wr = {};
@@ -919,16 +965,15 @@ static int send_dummy_ud_msg(void) {
 	ud_wr.remote_qpn = ctrl->server.ud_transport.qpn;
 	ud_wr.remote_qkey = ctrl->server.ud_transport.qkey;
 
-	/*
 	ret = ib_post_send(ctrl->ud_qp, &ud_wr.wr, &bad_wr);
 	if (ret) {
 		pr_err("ib_post_send failed to send dummy msg.\n");
 	}
-	*/
 
 	pr_info("send_dummy_ud_msg completed.\n");
 	return 0;
 }
+*/
 
 
 static int init_ud_comms(void) {
