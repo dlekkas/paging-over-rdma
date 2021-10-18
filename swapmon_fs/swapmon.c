@@ -47,7 +47,6 @@ int page_cnt = 0;
 static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
 
-static struct rb_root mcswap_tree = RB_ROOT;
 static struct kmem_cache *mcswap_entry_cache;
 static struct kmem_cache *rdma_req_cache;
 
@@ -69,9 +68,17 @@ struct mcswap_entry {
 	struct page_info info;
 };
 
+struct mcswap_tree {
+	struct rb_root root;
+	spinlock_t lock;
+};
+
+static struct mcswap_tree *mcswap_trees[MAX_SWAPFILES];
+
 struct page_ack_req {
 	struct ib_cqe cqe;
 	struct mcswap_entry *entry;
+	unsigned swap_type;
 };
 
 
@@ -120,10 +127,12 @@ static int mcswap_rb_insert(struct rb_root *root,
 static int mcswap_rb_erase(struct rb_root *root, pgoff_t offset) {
 	struct mcswap_entry *data;
 	data = rb_find_page_remote_info(root, offset);
-	if (!RB_EMPTY_NODE(&data->node)) {
-		rb_erase(&data->node, root);
-		RB_CLEAR_NODE(&data->node);
-		return 0;
+	if (data) {
+		if (!RB_EMPTY_NODE(&data->node)) {
+			rb_erase(&data->node, root);
+			RB_CLEAR_NODE(&data->node);
+			return 0;
+		}
 	}
 	return -1;
 }
@@ -221,7 +230,17 @@ struct swapmon_rdma_ctrl* ctrl;
 
 
 static void swapmon_init(unsigned swap_type) {
-	printk("swapmon_init(%d)", swap_type);
+	struct mcswap_tree *tree;
+	pr_info("%s(%d)", __func__, swap_type);
+
+	tree = kzalloc(sizeof(*tree), GFP_KERNEL);
+	if (!tree) {
+		pr_err("failed to alloc memory for red-black tree.\n");
+		return;
+	}
+	tree->root = RB_ROOT;
+	spin_lock_init(&tree->lock);
+	mcswap_trees[swap_type] = tree;
 }
 
 static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
@@ -267,6 +286,7 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 }
 
 static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
+	struct mcswap_tree *tree;
 	struct mcswap_entry *ent;
 	struct page_ack_req *req;
 	pgoff_t offset;
@@ -284,21 +304,24 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 	}
 
 	req = container_of(wc->wr_cqe, struct page_ack_req, cqe);
+	tree = mcswap_trees[req->swap_type];
 	ent = req->entry;
-	offset = ntohl(wc->ex.imm_data);
 
-	ret = mcswap_rb_insert(&mcswap_tree, req->entry);
+	offset = ntohl(wc->ex.imm_data);
+	spin_lock(&tree->lock);
+	ret = mcswap_rb_insert(&tree->root, req->entry);
 	if (ret) {
-		// entry already exists for this offset, so we need to free the
-		// mcswap_entry structure here.
+		// entry already exists for this offset, so we need to release
+		// the lock and free the mcswap_entry structure here.
+		spin_unlock(&tree->lock);
 		kmem_cache_free(mcswap_entry_cache, req->entry);
 	} else {
-		// entry was added to the remote memory mapping, so print logs
-		ent = rb_find_page_remote_info(&mcswap_tree, offset);
+		// entry was added to the remote memory mapping
+		ent = rb_find_page_remote_info(&tree->root, offset);
+		spin_unlock(&tree->lock);
 		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
 				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
   }
-
 	kmem_cache_free(rdma_req_cache, req);
 }
 
@@ -357,12 +380,9 @@ static struct page_info* find_page_remote_info(pgoff_t offset) {
 
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
-	int ret;
-	bool done;
-	int retries;
-	struct ib_wc wc;
 	struct mcswap_entry* rmem_node;
 	struct page_ack_req* req;
+	int ret;
 
 	// run for 32 pages
 	if (page_cnt >= 110) {
@@ -388,6 +408,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	}
 	req->entry = rmem_node;
 	req->cqe.done = page_ack_done;
+	req->swap_type = swap_type;
 
 	// post RR for the ACK message to be received from mem server
 	ret = post_recv_page_ack_msg(req);
@@ -441,6 +462,7 @@ struct hack_s {
 	struct completion req_done;
 };
 
+/*
 static void remote_page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 	struct hack_s *req;
 	pgoff_t offset;
@@ -455,6 +477,7 @@ static void remote_page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 	}
 	complete(&req->req_done);
 }
+*/
 
 static int swapmon_rdma_read(struct page *page,
 		struct mcswap_entry *ent) {
@@ -544,17 +567,21 @@ static int swapmon_rdma_read(struct page *page,
 
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
+	struct mcswap_tree *tree = mcswap_trees[swap_type];
 	struct mcswap_entry *entry;
 	int ret;
 
 	pr_info("%s(swap_type = %u, offset = %lu)\n",
 				 __func__, swap_type, offset);
 
-	entry = rb_find_page_remote_info(&mcswap_tree, offset);
+	spin_lock(&tree->lock);
+	entry = rb_find_page_remote_info(&tree->root, offset);
 	if (!entry) {
 		pr_err("failed to find page metadata in red-black tree.\n");
+		spin_unlock(&tree->lock);
 		return -1;
 	}
+	spin_unlock(&tree->lock);
 
 	ret = swapmon_rdma_read(page, entry);
 	if (unlikely(ret)) {
@@ -568,28 +595,37 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 }
 
 static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
+	struct mcswap_tree *tree = mcswap_trees[swap_type];
 	int ret;
-	printk("swapmon: invalidate_page(swap_type = %u, offset = %lu)\n",
+	pr_info("invalidate_page(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
 
-	ret = mcswap_rb_erase(&mcswap_tree, offset);
+	spin_lock(&tree->lock);
+	ret = mcswap_rb_erase(&tree->root, offset);
 	if (unlikely(ret)) {
-		pr_err("could not erase page with offset = %lu\n", offset);
+		pr_err("failed to erase page with offset = %lu\n", offset);
 		return;
 	}
+	spin_unlock(&tree->lock);
 }
 
 static void swapmon_invalidate_area(unsigned swap_type) {
+	struct mcswap_tree *tree = mcswap_trees[swap_type];
 	struct mcswap_entry *curr, *tmp;
 	pr_info("swapmon: invalidate_area(swap_type = %u)\n", swap_type);
-	rbtree_postorder_for_each_entry_safe(curr, tmp, &mcswap_tree, node) {
+
+	spin_lock(&tree->lock);
+	rbtree_postorder_for_each_entry_safe(curr, tmp, &tree->root, node) {
 		// TODO(dimlek): the check for empty node might not be needed here.
 		if (!RB_EMPTY_NODE(&curr->node)) {
-			rb_erase(&curr->node, &mcswap_tree);
+			rb_erase(&curr->node, &tree->root);
 			kmem_cache_free(mcswap_entry_cache, curr);
 			RB_CLEAR_NODE(&curr->node);
 		}
 	}
+	spin_unlock(&tree->lock);
+	kfree(tree);
+	mcswap_trees[swap_type] = NULL;
 }
 
 static struct frontswap_ops swapmon_fs_ops = {
