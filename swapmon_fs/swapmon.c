@@ -173,7 +173,8 @@ struct swapmon_rdma_ctrl {
 	struct ib_qp *mcast_qp;
 
 	// completion queue (CQ)
-	struct ib_cq *cq;
+	struct ib_cq *send_cq;
+	struct ib_cq *recv_cq;
 	struct ib_cq *mcast_cq;
 
 	struct server_info server;
@@ -324,7 +325,6 @@ static int post_recv_page_ack_msg(struct page_ack_req *req) {
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
 	wr.wr_cqe = &req->cqe;
-	// wr.wr_id = req->entry->offset;
 	wr.next = NULL;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
@@ -365,7 +365,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	struct page_ack_req* req;
 
 	// run for 32 pages
-	if (page_cnt >= 105) {
+	if (page_cnt >= 110) {
 		return -1;
 	} else {
 		page_cnt++;
@@ -405,7 +405,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 
 	/*
 	while (true) {
-		ret = ib_poll_cq(ctrl->cq, 1, &wc);
+		ret = ib_poll_cq(ctrl->send_cq, 1, &wc);
 		if (ret < 0) {
 			pr_err("polling failed.\n");
 			break;
@@ -433,7 +433,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 			page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
 	*/
 
-	return -1;
+	return 0;
 }
 
 struct hack_s {
@@ -456,12 +456,14 @@ static void remote_page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 	complete(&req->req_done);
 }
 
-static int swapmon_rdma_read(struct page *page, struct page_info *info) {
+static int swapmon_rdma_read(struct page *page,
+		struct mcswap_entry *ent) {
 	struct ib_send_wr *bad_send_wr;
 	struct ib_rdma_wr rdma_wr;
 	struct ib_sge sge;
 	struct ib_wc wc;
 	u64 dma_addr;
+	int retries;
 	int ret;
 
   dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
@@ -478,9 +480,12 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 	sge.length = PAGE_SIZE;
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
+	/*
 	struct hack_s hack;
 	init_completion(&hack.req_done);
 	hack.cqe.done = remote_page_read_done;
+	rdma_wr.wr.wr_cqe = &hack.cqe;
+	*/
 
 	/*
 	rdma_wr.wr.wr_cqe = (struct ib_cqe *)
@@ -490,17 +495,16 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 		return -ENOMEM;
 	}
 	*/
-	rdma_wr.wr.wr_cqe = &hack.cqe;
 
-	//rdma_wr.wr.wr_id = 2222;
+	rdma_wr.wr.wr_id = ent->offset;
 	rdma_wr.wr.next = NULL;
 	rdma_wr.wr.sg_list = &sge;
 	rdma_wr.wr.num_sge = 1;
 	rdma_wr.wr.opcode = IB_WR_RDMA_READ;
 	rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
 
-	rdma_wr.remote_addr = info->remote_addr;
-	rdma_wr.rkey = info->rkey;
+	rdma_wr.remote_addr = ent->info.remote_addr;
+	rdma_wr.rkey = ent->info.rkey;
 
 	ret = ib_post_send(ctrl->qp, &rdma_wr.wr, &bad_send_wr);
 	if (ret) {
@@ -508,46 +512,38 @@ static int swapmon_rdma_read(struct page *page, struct page_info *info) {
 		return ret;
 	}
 
-	//wait_for_completion_interruptible_timeout(&hack.req_done,
-			//msecs_to_jiffies(2000));
-	mdelay(1);
-
-	/*
-	while (1) {
-		ret = ib_poll_cq(ctrl->qp->recv_cq, 1, &wc);
+	// TODO(dimlek): How shall we poll efficiently here and how many times
+	// should we poll for completion?
+	retries = 10000;
+	while (retries > 0) {
+		ret = ib_poll_cq(ctrl->qp->send_cq, 1, &wc);
 		if (ret > 0) {
-			if (wc.status != IB_WC_SUCCESS) {
+			if (unlikely(wc.status != IB_WC_SUCCESS)) {
 				pr_info("Polling failed with status %s.\n",
 							 ib_wc_status_msg(wc.status));
 				return wc.status;
 			}
-			if (wc.wr_id != 2222) {
-				pr_err("WARNING: wr_id != 2222.\n");
-				if (wc.wr_cqe) {
-					if (wc.wr_cqe->done == page_ack_done) {
-						wc.wr_cqe->done(ctrl->qp->recv_cq, &wc);
-					}
-				}
-			} else {
+			if (wc.wr_id == ent->offset) {
 				break;
+			} else {
+				pr_err("Received message with unexpected WR ID.\n");
 			}
 		} else if (ret < 0) {
-			break;
+			pr_err("ib_poll_cq for RDMA read failed.\n");
+			return ret;
 		}
+		retries--;
 	}
-	*/
-	/*
-	while (!ib_poll_cq(ctrl->qp->recv_cq, 1, &wc)) {
-		// nothing
+
+	if (retries <= 0) {
+		return -1;
 	}
-	*/
 
 	return 0;
 }
 
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
-	// struct page_info *info;
 	struct mcswap_entry *entry;
 	int ret;
 
@@ -560,7 +556,7 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
-	ret = swapmon_rdma_read(page, &entry->info);
+	ret = swapmon_rdma_read(page, entry);
 	if (unlikely(ret)) {
 		pr_info("failed to fetch remote page.\n");
 		return -1;
@@ -706,8 +702,8 @@ static int swapmon_rdma_create_qp(const int factor) {
 	init_attr.cap.max_send_sge = 1;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_RC;
-	init_attr.send_cq = ctrl->cq;
-	init_attr.recv_cq = ctrl->cq;
+	init_attr.send_cq = ctrl->send_cq;
+	init_attr.recv_cq = ctrl->recv_cq;
 
 	// allocate a queue pair (QP) and associate it with the specified
 	// RDMA identifier cm_id
@@ -754,16 +750,22 @@ static int swapmon_rdma_addr_resolved(void) {
 		goto out_free_pd;
 	}
 
-
 	// Before creating the local QP, we must first cause the HCA to create the CQs
 	// to be associated with the SQ and RQ of the QP about to be created. The QP's
 	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
 	// specifies the number of Completion Queue Entries (CQEs) and represents the
 	// size of the CQ.
-	ctrl->cq = ib_alloc_cq(ctrl->dev, ctrl, cq_factor * 1024, comp_vector,
-			IB_POLL_SOFTIRQ);
-	if (IS_ERR(ctrl->cq)) {
-		ret = PTR_ERR(ctrl->cq);
+	ctrl->send_cq = ib_alloc_cq(ctrl->dev, ctrl, cq_factor * 1024,
+			comp_vector, IB_POLL_SOFTIRQ);
+	if (IS_ERR(ctrl->send_cq)) {
+		ret = PTR_ERR(ctrl->send_cq);
+		goto out_err;
+	}
+
+	ctrl->recv_cq = ib_alloc_cq(ctrl->dev, ctrl, cq_factor * 1024,
+			comp_vector, IB_POLL_SOFTIRQ);
+	if (IS_ERR(ctrl->recv_cq)) {
+		ret = PTR_ERR(ctrl->recv_cq);
 		goto out_err;
 	}
 
@@ -788,7 +790,7 @@ static int swapmon_rdma_addr_resolved(void) {
 out_destroy_qp:
 	rdma_destroy_qp(ctrl->cm_id);
 out_destroy_ib_cq:
-	ib_free_cq(ctrl->cq);
+	ib_free_cq(ctrl->send_cq);
 out_free_pd:
 	ib_dealloc_pd(ctrl->pd);
 out_err:
@@ -818,7 +820,7 @@ static int swapmon_rdma_route_resolved(void) {
   ret = rdma_connect(ctrl->cm_id, &param);
   if (ret) {
     pr_err("rdma_connect failed (%d)\n", ret);
-    ib_free_cq(ctrl->cq);
+    ib_free_cq(ctrl->send_cq);
   }
 	pr_info("trying to rdma_connect() ...\n");
 
@@ -984,8 +986,8 @@ static int init_ud_comms(void) {
 	u16 sgid_index;
 	int ret;
 
-	qp_init_attr.send_cq = ctrl->cq;
-	qp_init_attr.recv_cq = ctrl->cq;
+	qp_init_attr.send_cq = ctrl->send_cq;
+	qp_init_attr.recv_cq = ctrl->recv_cq;
 	qp_init_attr.cap.max_send_wr  = 128;
 	qp_init_attr.cap.max_recv_wr  = 0;
 	qp_init_attr.cap.max_send_sge = 1;
