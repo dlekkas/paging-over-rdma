@@ -66,7 +66,6 @@ struct mcswap_entry {
 	struct rb_node node;
 	pgoff_t offset;
 	struct page_info info;
-	struct completion ack;
 };
 
 struct mcswap_tree {
@@ -79,8 +78,8 @@ static struct mcswap_tree *mcswap_trees[MAX_SWAPFILES];
 struct page_ack_req {
 	struct ib_cqe cqe;
 	struct mcswap_entry *entry;
+	struct completion ack;
 	unsigned swap_type;
-
 };
 
 
@@ -302,6 +301,25 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	return 0;
 }
 
+static void page_ack_done_sync(struct ib_cq *cq, struct ib_wc *wc) {
+	struct page_ack_req *req;
+
+	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+		if (wc->status == IB_WC_WR_FLUSH_ERR) {
+			// TODO(dimlek): here we should probably signal the completion
+			// and indicate somehow that
+			pr_info("CQ was flushed.\n");
+		} else {
+			pr_err("Polling failed with status: %s.\n",
+						 ib_wc_status_msg(wc->status));
+		}
+		return;
+	}
+
+	req = container_of(wc->wr_cqe, struct page_ack_req, cqe);
+	complete(&req->ack);
+}
+
 static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 	struct mcswap_tree *tree;
 	struct mcswap_entry *ent;
@@ -395,6 +413,79 @@ static struct page_info* find_page_remote_info(pgoff_t offset) {
 }
 */
 
+static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
+												 struct page *page) {
+	struct mcswap_tree *tree = mcswap_trees[swap_type];
+	struct mcswap_entry* rmem_node, *ent;
+	struct page_ack_req* req;
+	long wait_ret;
+	int ret;
+
+	pr_info("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
+				 ++page_cnt, swap_type, offset);
+
+	rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
+	if (unlikely(!rmem_node)) {
+		pr_err("kzalloc failed to allocate mem for u64.\n");
+		return -ENOMEM;
+	}
+	rmem_node->offset = offset;
+
+	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
+	if (unlikely(!req)) {
+		pr_err("slab allocator failed to allocate mem for page_ack_req.\n");
+		return -ENOMEM;
+	}
+	req->entry = rmem_node;
+	req->cqe.done = page_ack_done_sync;
+	req->swap_type = swap_type;
+	init_completion(&req->ack);
+
+	// post RR for the ACK message to be received from mem server
+	ret = post_recv_page_ack_msg(req);
+	if (ret) {
+		pr_err("post_recv_page_ack_msg failed.\n");
+		return -1;
+	}
+
+	// multicast the physical page to the memory servers
+	ret = swapmon_mcast_send(page, offset);
+	if (unlikely(ret)) {
+		pr_err("swapmon_mcast_send() failed.\n");
+		return -1;
+	}
+
+	wait_ret = wait_for_completion_interruptible_timeout(&req->ack,
+			msecs_to_jiffies(4) + 1);
+	if (unlikely(wait_ret == -ERESTARTSYS)) {
+		pr_err("interrupted on ack waiting.\n");
+		return wait_ret;
+	} else if (unlikely(wait_ret == 0)) {
+		pr_err("timed out on ack waiting.\n");
+		return -1;
+	}
+
+	// once we are here we have successfully received an ACK from mem server
+	spin_lock(&tree->lock);
+	ret = mcswap_rb_insert(&tree->root, req->entry);
+	if (ret) {
+		// entry already exists for this offset, so we need to release
+		// the lock and free the mcswap_entry structure here.
+		spin_unlock(&tree->lock);
+		kmem_cache_free(mcswap_entry_cache, req->entry);
+	} else {
+		// entry was added to the remote memory mapping
+		ent = rb_find_page_remote_info(&tree->root, offset);
+		spin_unlock(&tree->lock);
+		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
+				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
+  }
+	kmem_cache_free(rdma_req_cache, req);
+
+	return -1;
+}
+
+
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	struct mcswap_entry* rmem_node;
@@ -422,7 +513,6 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		return -ENOMEM;
 	}
 	rmem_node->offset = offset;
-	//init_completion(&rmem_node->ack);
 
 	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
 	if (unlikely(!req)) {
@@ -447,9 +537,6 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
-
-	//wait_for_completion_interruptible_timeout(&ctrl->mcast_ack,
-			//msecs_to_jiffies(SWAPMON_MCAST_JOIN_TIMEOUT_MS) + 1);
 	/*
 	while (true) {
 		ret = ib_poll_cq(ctrl->send_cq, 1, &wc);
@@ -661,7 +748,7 @@ static struct frontswap_ops swapmon_fs_ops = {
 	.init  = swapmon_init,
 	// copies the page to transcendent memory and associate it with the type
 	// and offset associated with the page.
-	.store = swapmon_store,
+	.store = swapmon_store_sync,
 	// copies the page, if found, from transcendent memory into kernel memory,
 	// but will not remove the page from transcendent memory.
 	.load  = swapmon_load,
