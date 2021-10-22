@@ -24,10 +24,12 @@
 #define IBV_DEFAULT_PKEY_FULL 0xFFFF
 
 // Memory size allocated for remote peers.
-constexpr std::size_t BUFFER_SIZE(4096 * 4096);
+constexpr std::size_t BUFFER_SIZE(32 * 4096 * 4096);
 
 // Completion Queue (CQ) will contain at least `MIN_CQE` entries.
 constexpr int MIN_CQE(8192);
+
+int outstanding_cqe = 0;
 
 
 enum comm_ctrl_opcode {
@@ -67,7 +69,7 @@ class ConnectionRDMA {
 class ServerRDMA {
 
  public:
-	ServerRDMA(): n_conns_(0) {}
+	ServerRDMA(): n_conns_(0), n_posted_recvs_(0), curr_idx_(0) {}
 
 	~ServerRDMA();
 
@@ -147,6 +149,10 @@ class ServerRDMA {
 
 	// Number of accepted connections.
 	int n_conns_;
+
+	int n_posted_recvs_;
+
+	int curr_idx_;
 
 	struct mcast_grp_info {
 		uint8_t gid_raw[16];
@@ -295,7 +301,7 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	attr.send_cq = cq_;
 	attr.recv_cq = cq_;
 	attr.srq = NULL;
-	attr.cap.max_send_wr = 6;
+	attr.cap.max_send_wr = 8192;
 	attr.cap.max_recv_wr = 6;
 	attr.cap.max_send_sge = 1;
 	attr.cap.max_recv_sge = 1;
@@ -834,7 +840,8 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 
 	struct ibv_recv_wr wr, *bad_wr;
 	for (int i = 0; i < std::min(n_wrs, max_wrs); i++) {
-		uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) + i * 4096;
+		uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) +
+			(curr_idx_ + i) * 4096;
 		// sge for storing the remote page
 		sge[1].addr = page_addr;
 		sge[1].length = 4096;
@@ -869,7 +876,7 @@ void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 	sge.lkey = mr_->lkey;
 
 	struct ibv_send_wr wr, *bad_wr;
-	wr.wr_id = 69;
+	wr.wr_id = page_id;
 	wr.next = NULL;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
@@ -881,21 +888,10 @@ void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 		std::cerr << "ibv_post_send() failed: " << std::strerror(errno) << "\n";
 		return;
 	}
-
-	/*
-	struct ibv_wc wc;
-	int timeout_ms = 10000;
-	// int ret = poll_cq_with_timeout(rc_qp_->send_cq, 1, &wc, timeout_ms);
-
-	while (!ibv_poll_cq(cq_, 1, &wc)) {
-		// nothing
+	outstanding_cqe++;
+	if (outstanding_cqe > MIN_CQE-10) {
+		std::cerr << "Warning: completion queue almost full.\n";
 	}
-
-	if (wc.status != IBV_WC_SUCCESS) {
-		std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
-							<< ", work request ID: " << wc.wr_id << std::endl;
-	}
-	*/
 }
 
 int ServerRDMA::Poll(int timeout_s) {
@@ -912,51 +908,76 @@ int ServerRDMA::Poll(int timeout_s) {
 	// Post as many RRs in the work queue as possible in order to avoid doing it
 	// when flooded by incoming pages.
 	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr);
-	int succ_posts = post_page_recv_requests(mcast_qp_, 128);
-	std::cout << "Posted " << succ_posts << " RRs for pages.\n";
+	int succ_posts = post_page_recv_requests(mcast_qp_, 8192);
+	n_posted_recvs_ += succ_posts;
+	curr_idx_ += succ_posts;
+	std::cout << "Posted " << n_posted_recvs_ << " RRs for pages.\n";
 
 	int cnt = 0;
 	// Loop until timeout and poll for work completions (i.e. received pages).
 	while (std::chrono::system_clock::now() <= end) {
-		struct ibv_wc wc;
-		int n_wrs = ibv_poll_cq(mcast_cq_, 1, &wc);
+		struct ibv_wc wc[64];
+		int n_wrs = ibv_poll_cq(mcast_cq_, 64, wc);
 		if (n_wrs < 0) {
 			std::cerr << "issue with ibv_poll_cq().\n";
 		}
 		for (auto i = 0; i < n_wrs; i++) {
-			if (!(wc.opcode & IBV_WC_RECV)) {
+			if (!(wc[i].opcode & IBV_WC_RECV)) {
 				break;
 			}
-			if (wc.qp_num != mcast_qp_->qp_num) {
+			if (wc[i].qp_num != mcast_qp_->qp_num) {
 				std::cerr << "Wrong qpn in multicast cq.\n";
 				break;
 			}
-			if (wc.status == IBV_WC_SUCCESS) {
-				uint64_t page_store_addr = wc.wr_id;
-				uint32_t page_id = ntohl(wc.imm_data);
-				if (wc.wc_flags & IBV_WC_WITH_IMM) {
+			if (wc[i].status == IBV_WC_SUCCESS) {
+				uint64_t page_store_addr = wc[i].wr_id;
+				uint32_t page_id = ntohl(wc[i].imm_data);
+				if (wc[i].wc_flags & IBV_WC_WITH_IMM) {
 					cnt++;
+					n_posted_recvs_--;
 					std::cout << cnt << " Remote page with id = " << page_id <<
 						" stored at addr = " << page_store_addr << "\n";
 					send_ack(page_id, page_store_addr, mr_->rkey);
 				}
 			} else {
 				std::cerr << "Polling failed with status "
-					<< ibv_wc_status_str(wc.status) << ", work request ID: "
-					<< wc.wr_id << std::endl;
+					<< ibv_wc_status_str(wc[i].status) << ", work request ID: "
+					<< wc[i].wr_id << std::endl;
 				break;
 			}
 		}
-		int rc_wrs = ibv_poll_cq(cq_, 1, &wc);
-		if (rc_wrs > 0) {
-			if (wc.qp_num != rc_qp_->qp_num) {
+
+		// if ((n_wrs < 16) && (n_posted_recvs_ < 8192 - 64)) {
+		if ((n_posted_recvs_ < 4096)) {
+			// TODO(dimlek): What is a good number of recv requests to post here?
+			// We don't want to post a lot due to risk of increasing backpressure.
+			succ_posts = post_page_recv_requests(mcast_qp_, 32);
+			n_posted_recvs_ += succ_posts;
+			curr_idx_ += succ_posts;
+		} else if (n_posted_recvs_ < 512) {
+			// we need to post pages urgently to avoid receiving message without
+			// having a posted WR ready
+			std::cout << "Running low on posted recvs: "
+				<< n_posted_recvs_ << "\n";
+			succ_posts = post_page_recv_requests(mcast_qp_, 128);
+			n_posted_recvs_ += succ_posts;
+			curr_idx_ += succ_posts;
+		}
+
+		int rc_wrs = ibv_poll_cq(cq_, 64, wc);
+		outstanding_cqe -= rc_wrs;
+		for (int i = 0; i < rc_wrs; i++) {
+			if (wc[i].qp_num != rc_qp_->qp_num) {
 				std::cerr << "wrong qpn.\n";
 				break;
 			}
-			if (wc.status != IBV_WC_SUCCESS) {
+			if (wc[i].status != IBV_WC_SUCCESS) {
 				std::cerr << "ACK message failure.\n";
+			} else {
+				std::cout << "ACK received for page with id = "
+					<< wc[i].wr_id << "\n";
 			}
-	 	}
+		}
 	}
 	return 0;
 }
@@ -1006,8 +1027,8 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Polling for 20sec." << std::endl;
-	server.Poll(20);
+	std::cout << "Polling for 40sec." << std::endl;
+	server.Poll(40);
 
 	return 0;
 }

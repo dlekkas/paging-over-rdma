@@ -66,6 +66,7 @@ struct mcswap_entry {
 	struct rb_node node;
 	pgoff_t offset;
 	struct page_info info;
+	struct completion ack;
 };
 
 struct mcswap_tree {
@@ -79,6 +80,7 @@ struct page_ack_req {
 	struct ib_cqe cqe;
 	struct mcswap_entry *entry;
 	unsigned swap_type;
+
 };
 
 
@@ -243,6 +245,14 @@ static void swapmon_init(unsigned swap_type) {
 	mcswap_trees[swap_type] = tree;
 }
 
+static void swapmon_mcast_done(struct ib_cq *cq, struct ib_wc *wc) {
+	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+		pr_err("Polling failed with status: %s.\n",
+					 ib_wc_status_msg(wc->status));
+		return;
+	}
+}
+
 static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	struct ib_send_wr *bad_wr;
 	struct ib_ud_wr ud_wr;
@@ -265,11 +275,18 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 	sge.lkey = ctrl->mcast_pd->local_dma_lkey;
 
 	ud_wr.wr.next = NULL;
-	ud_wr.wr.wr_id = 1111;
+	ud_wr.wr.wr_cqe = (struct ib_cqe *)
+		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
+	if (!ud_wr.wr.wr_cqe) {
+		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
+		return -ENOMEM;
+	}
+	ud_wr.wr.wr_cqe->done = swapmon_mcast_done;
+	//ud_wr.wr.wr_id = 1111;
 	ud_wr.wr.sg_list = &sge;
 	ud_wr.wr.num_sge = 1;
 	ud_wr.wr.opcode = IB_WR_SEND_WITH_IMM;
-	ud_wr.wr.send_flags = 0;
+	ud_wr.wr.send_flags = IB_SEND_SIGNALED;
 	ud_wr.wr.ex.imm_data = htonl(offset);
 
 	ud_wr.ah = ctrl->mcast_ah;
@@ -278,7 +295,7 @@ static int swapmon_mcast_send(struct page *page, pgoff_t offset) {
 
 	ret = ib_post_send(ctrl->mcast_qp, &ud_wr.wr, &bad_wr);
 	if (ret) {
-		pr_err("ib_post_send failed to send page.\n");
+		pr_err("ib_post_send failed to send page (error = %d).\n", ret);
 		return ret;
 	}
 
@@ -354,7 +371,7 @@ static int post_recv_page_ack_msg(struct page_ack_req *req) {
 
 	ret = ib_post_recv(ctrl->qp, &wr, &bad_wr);
 	if (ret) {
-		pr_err("ib_post_recv failed to post RR for page ack.\n");
+		pr_err("ib_post_recv failed to post RR for page ack (code = %d).\n", ret);
 		return ret;
 	}
 
@@ -384,12 +401,17 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	struct page_ack_req* req;
 	int ret;
 
-	// run for 32 pages
-	if (page_cnt >= 110) {
+	page_cnt++;
+	if (page_cnt % 64 == 0) {
+		mdelay(7);
+	}
+	/*
+	if (page_cnt >= 350) {
 		return -1;
 	} else {
 		page_cnt++;
 	}
+	*/
 
 	printk("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
 				 page_cnt, swap_type, offset);
@@ -400,6 +422,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		return -ENOMEM;
 	}
 	rmem_node->offset = offset;
+	//init_completion(&rmem_node->ack);
 
 	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
 	if (unlikely(!req)) {
@@ -424,6 +447,9 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
+
+	//wait_for_completion_interruptible_timeout(&ctrl->mcast_ack,
+			//msecs_to_jiffies(SWAPMON_MCAST_JOIN_TIMEOUT_MS) + 1);
 	/*
 	while (true) {
 		ret = ib_poll_cq(ctrl->send_cq, 1, &wc);
@@ -454,7 +480,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 			page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
 	*/
 
-	return 0;
+	return -1;
 }
 
 struct hack_s {
@@ -537,7 +563,7 @@ static int swapmon_rdma_read(struct page *page,
 
 	// TODO(dimlek): How shall we poll efficiently here and how many times
 	// should we poll for completion?
-	retries = 10000;
+	retries = 30000;
 	while (retries > 0) {
 		ret = ib_poll_cq(ctrl->qp->send_cq, 1, &wc);
 		if (ret > 0) {
@@ -571,8 +597,8 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	struct mcswap_entry *entry;
 	int ret;
 
-	pr_info("%s(swap_type = %u, offset = %lu)\n",
-				 __func__, swap_type, offset);
+	//pr_info("%s(swap_type = %u, offset = %lu)\n",
+				 //__func__, swap_type, offset);
 
 	spin_lock(&tree->lock);
 	entry = rb_find_page_remote_info(&tree->root, offset);
@@ -733,7 +759,7 @@ static int swapmon_rdma_create_qp(const int factor) {
 	/* +1 for drain */
 	init_attr.cap.max_send_wr = factor * ctrl->queue_size + 1;
 	/* +1 for drain */
-	init_attr.cap.max_recv_wr = ctrl->queue_size + 64;
+	init_attr.cap.max_recv_wr = 12 * 1024;
 	init_attr.cap.max_recv_sge = 1;
 	init_attr.cap.max_send_sge = 1;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
@@ -754,7 +780,7 @@ static int swapmon_rdma_create_qp(const int factor) {
 
 
 static int swapmon_rdma_addr_resolved(void) {
-	const int send_wr_factor = 3;
+	const int send_wr_factor = 11;
 	const int cq_factor = send_wr_factor + 1;
 	int comp_vector = 0;
 	int ret;
@@ -922,7 +948,7 @@ static int mcast_logic(void) {
 	}
 	pr_info("[MCAST]: ib_alloc_pd completed successfully.\n");
 
-	ctrl->mcast_cq = ib_alloc_cq(ctrl->dev, ctrl, 4096, 0, IB_POLL_SOFTIRQ);
+	ctrl->mcast_cq = ib_alloc_cq(ctrl->dev, ctrl, 12288, 0, IB_POLL_SOFTIRQ);
 	if (IS_ERR(ctrl->mcast_cq)) {
 		ret = PTR_ERR(ctrl->mcast_cq);
 	}
@@ -931,7 +957,7 @@ static int mcast_logic(void) {
 	// TODO(dimlek): set max_send/recv properly
 	memset(&init_attr, 0, sizeof(init_attr));
 	init_attr.event_handler = swapmon_rdma_qp_event;
-	init_attr.cap.max_send_wr = 128;
+	init_attr.cap.max_send_wr = 12 * 1024;
 	init_attr.cap.max_send_sge = 1;
 	init_attr.cap.max_recv_wr = 0;
 	init_attr.cap.max_recv_sge = 0;
