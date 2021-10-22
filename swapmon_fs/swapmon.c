@@ -48,6 +48,7 @@ static int swapmon_rdma_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event);
 
 static struct kmem_cache *mcswap_entry_cache;
+static struct kmem_cache *page_ack_req_cache;
 static struct kmem_cache *rdma_req_cache;
 
 static DEFINE_MUTEX(swapmon_rdma_ctrl_mutex);
@@ -74,6 +75,11 @@ struct mcswap_tree {
 };
 
 static struct mcswap_tree *mcswap_trees[MAX_SWAPFILES];
+
+struct rdma_req {
+	struct ib_cqe cqe;
+	struct completion done;
+};
 
 struct page_ack_req {
 	struct ib_cqe cqe;
@@ -343,21 +349,21 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 	ent = req->entry;
 
 	offset = ntohl(wc->ex.imm_data);
-	spin_lock(&tree->lock);
+	spin_lock_bh(&tree->lock);
 	ret = mcswap_rb_insert(&tree->root, req->entry);
 	if (ret) {
 		// entry already exists for this offset, so we need to release
 		// the lock and free the mcswap_entry structure here.
-		spin_unlock(&tree->lock);
+		spin_unlock_bh(&tree->lock);
 		kmem_cache_free(mcswap_entry_cache, req->entry);
 	} else {
 		// entry was added to the remote memory mapping
 		ent = rb_find_page_remote_info(&tree->root, offset);
-		spin_unlock(&tree->lock);
+		spin_unlock_bh(&tree->lock);
 		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
 				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
   }
-	kmem_cache_free(rdma_req_cache, req);
+	kmem_cache_free(page_ack_req_cache, req);
 }
 
 static int post_recv_page_ack_msg(struct page_ack_req *req) {
@@ -431,7 +437,7 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 	}
 	rmem_node->offset = offset;
 
-	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
+	req = kmem_cache_alloc(page_ack_req_cache, GFP_KERNEL);
 	if (unlikely(!req)) {
 		pr_err("slab allocator failed to allocate mem for page_ack_req.\n");
 		return -ENOMEM;
@@ -466,23 +472,23 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 	}
 
 	// once we are here we have successfully received an ACK from mem server
-	spin_lock(&tree->lock);
+	spin_lock_bh(&tree->lock);
 	ret = mcswap_rb_insert(&tree->root, req->entry);
 	if (ret) {
 		// entry already exists for this offset, so we need to release
 		// the lock and free the mcswap_entry structure here.
-		spin_unlock(&tree->lock);
+		spin_unlock_bh(&tree->lock);
 		kmem_cache_free(mcswap_entry_cache, req->entry);
 	} else {
 		// entry was added to the remote memory mapping
 		ent = rb_find_page_remote_info(&tree->root, offset);
-		spin_unlock(&tree->lock);
+		spin_unlock_bh(&tree->lock);
 		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
 				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
   }
-	kmem_cache_free(rdma_req_cache, req);
+	kmem_cache_free(page_ack_req_cache, req);
 
-	return -1;
+	return 0;
 }
 
 
@@ -514,7 +520,7 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	}
 	rmem_node->offset = offset;
 
-	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
+	req = kmem_cache_alloc(page_ack_req_cache, GFP_KERNEL);
 	if (unlikely(!req)) {
 		pr_err("slab allocator failed to allocate mem for page_ack_req.\n");
 		return -ENOMEM;
@@ -575,22 +581,77 @@ struct hack_s {
 	struct completion req_done;
 };
 
-/*
-static void remote_page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
-	struct hack_s *req;
-	pgoff_t offset;
-	int ret;
-
-	req = container_of(wc->wr_cqe, struct hack_s, cqe);
+static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
+	struct rdma_req *req = container_of(wc->wr_cqe, struct rdma_req, cqe);
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
 		pr_err("Polling failed with status: %s.\n",
 					 ib_wc_status_msg(wc->status));
-		complete(&req->req_done);
 		return;
 	}
-	complete(&req->req_done);
+	complete(&req->done);
 }
-*/
+
+static int swapmon_rdma_read_sync(struct page *page,
+		struct mcswap_entry *ent) {
+	struct ib_send_wr *bad_send_wr;
+	struct ib_rdma_wr rdma_wr;
+	struct rdma_req *req;
+	struct ib_sge sge;
+	u64 dma_addr;
+	long wait_ret;
+	int ret;
+
+  dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
+			PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
+		pr_err("%s: dma mapping error\n", __func__);
+		return -1;
+	}
+
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			PAGE_SIZE, DMA_BIDIRECTIONAL);
+
+	sge.addr = dma_addr;
+	sge.length = PAGE_SIZE;
+	sge.lkey = ctrl->pd->local_dma_lkey;
+
+	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
+	if (unlikely(!req)) {
+		pr_err("slab allocator failed to allocate mem for rdma_req.\n");
+		return -ENOMEM;
+	}
+	req->cqe.done = page_read_done;
+	init_completion(&req->done);
+
+	rdma_wr.wr.wr_cqe = &req->cqe;
+	rdma_wr.wr.next = NULL;
+	rdma_wr.wr.sg_list = &sge;
+	rdma_wr.wr.num_sge = 1;
+	rdma_wr.wr.opcode = IB_WR_RDMA_READ;
+	rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+
+	rdma_wr.remote_addr = ent->info.remote_addr;
+	rdma_wr.rkey = ent->info.rkey;
+
+	ret = ib_post_send(ctrl->qp, &rdma_wr.wr, &bad_send_wr);
+	if (ret) {
+		pr_err("ib_post_send failed to read remote page.\n");
+		return ret;
+	}
+
+	wait_ret = wait_for_completion_interruptible_timeout(&req->done,
+			msecs_to_jiffies(4) + 1);
+	if (unlikely(wait_ret == -ERESTARTSYS)) {
+		pr_err("interrupted on ack waiting.\n");
+		return wait_ret;
+	} else if (unlikely(wait_ret == 0)) {
+		pr_err("timed out on ack waiting.\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 
 static int swapmon_rdma_read(struct page *page,
 		struct mcswap_entry *ent) {
@@ -615,13 +676,6 @@ static int swapmon_rdma_read(struct page *page,
 	sge.addr = dma_addr;
 	sge.length = PAGE_SIZE;
 	sge.lkey = ctrl->pd->local_dma_lkey;
-
-	/*
-	struct hack_s hack;
-	init_completion(&hack.req_done);
-	hack.cqe.done = remote_page_read_done;
-	rdma_wr.wr.wr_cqe = &hack.cqe;
-	*/
 
 	/*
 	rdma_wr.wr.wr_cqe = (struct ib_cqe *)
@@ -684,19 +738,20 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	struct mcswap_entry *entry;
 	int ret;
 
-	//pr_info("%s(swap_type = %u, offset = %lu)\n",
-				 //__func__, swap_type, offset);
+	pr_info("%s(swap_type = %u, offset = %lu)\n",
+				 __func__, swap_type, offset);
 
-	spin_lock(&tree->lock);
+	spin_lock_bh(&tree->lock);
 	entry = rb_find_page_remote_info(&tree->root, offset);
 	if (!entry) {
 		pr_err("failed to find page metadata in red-black tree.\n");
-		spin_unlock(&tree->lock);
+		spin_unlock_bh(&tree->lock);
 		return -1;
 	}
-	spin_unlock(&tree->lock);
+	spin_unlock_bh(&tree->lock);
 
-	ret = swapmon_rdma_read(page, entry);
+	// ret = swapmon_rdma_read(page, entry);
+	ret = swapmon_rdma_read_sync(page, entry);
 	if (unlikely(ret)) {
 		pr_info("failed to fetch remote page.\n");
 		return -1;
@@ -713,13 +768,13 @@ static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
 	pr_info("invalidate_page(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
 
-	spin_lock(&tree->lock);
+	spin_lock_bh(&tree->lock);
 	ret = mcswap_rb_erase(&tree->root, offset);
 	if (unlikely(ret)) {
 		pr_err("failed to erase page with offset = %lu\n", offset);
 		return;
 	}
-	spin_unlock(&tree->lock);
+	spin_unlock_bh(&tree->lock);
 }
 
 static void swapmon_invalidate_area(unsigned swap_type) {
@@ -727,7 +782,7 @@ static void swapmon_invalidate_area(unsigned swap_type) {
 	struct mcswap_entry *curr, *tmp;
 	pr_info("swapmon: invalidate_area(swap_type = %u)\n", swap_type);
 
-	spin_lock(&tree->lock);
+	spin_lock_bh(&tree->lock);
 	rbtree_postorder_for_each_entry_safe(curr, tmp, &tree->root, node) {
 		// TODO(dimlek): the check for empty node might not be needed here.
 		if (!RB_EMPTY_NODE(&curr->node)) {
@@ -736,7 +791,7 @@ static void swapmon_invalidate_area(unsigned swap_type) {
 			RB_CLEAR_NODE(&curr->node);
 		}
 	}
-	spin_unlock(&tree->lock);
+	spin_unlock_bh(&tree->lock);
 	kfree(tree);
 	mcswap_trees[swap_type] = NULL;
 }
@@ -1768,9 +1823,15 @@ static int __init swapmonfs_init(void) {
 		return -1;
 	}
 
-	rdma_req_cache = KMEM_CACHE(page_ack_req, 0);
-	if (unlikely(!rdma_req_cache)) {
+	page_ack_req_cache = KMEM_CACHE(page_ack_req, 0);
+	if (unlikely(!page_ack_req_cache)) {
 		pr_err("failed to create slab cache for page ack req entries.\n");
+		return -1;
+	}
+
+	rdma_req_cache = KMEM_CACHE(rdma_req, 0);
+	if (unlikely(!rdma_req_cache)) {
+		pr_err("failed to create slab cache for rdma req entries.\n");
 		return -1;
 	}
 
