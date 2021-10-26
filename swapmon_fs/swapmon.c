@@ -20,6 +20,8 @@
  * GNU General Public License for more details.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/frontswap.h>
 #include <linux/vmalloc.h>
@@ -40,7 +42,36 @@
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
+#define MCSWAP_PAGE_ACK_TIMEOUT_MS 4
 #define UC_QKEY 0x11111111
+
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+static atomic_t mcswap_stored_pages = ATOMIC_INIT(0);
+static unsigned long mcswap_store_avg_ns= 0;
+
+static struct dentry *mcswap_debugfs_root;
+
+static int __init mcswap_debugfs_init(void) {
+	if (!debugfs_initialized()) {
+		return -ENODEV;
+	}
+
+	mcswap_debugfs_root = debugfs_create_dir("mcswap", NULL);
+	if (!mcswap_debugfs_root) {
+		return -ENOMEM;
+	}
+
+	debugfs_create_atomic_t("stored_pages", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_stored_pages);
+	debugfs_create_ulong("store_avg_ns", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_store_avg_ns);
+	return 0;
+}
+#else
+static int __init mcswap_debugfs_init(void) { return 0; }
+static void __exit mcswap_debugfs_exit(void) { }
+#endif
 
 int page_cnt = 0;
 
@@ -326,6 +357,7 @@ static void page_ack_done_sync(struct ib_cq *cq, struct ib_wc *wc) {
 	complete(&req->ack);
 }
 
+/*
 static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 	struct mcswap_tree *tree;
 	struct mcswap_entry *ent;
@@ -365,6 +397,7 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
   }
 	kmem_cache_free(page_ack_req_cache, req);
 }
+*/
 
 static int post_recv_page_ack_msg(struct page_ack_req *req) {
 	struct ib_recv_wr wr, *bad_wr;
@@ -403,34 +436,14 @@ static int post_recv_page_ack_msg(struct page_ack_req *req) {
 }
 
 
-// TODO(dimlek): here we should also consider the `swap_type`, since
-// we may have several.
-/*
-static struct page_info* find_page_remote_info(pgoff_t offset) {
-	struct page_node *curr;
-	hash_for_each_possible(rmem_map, curr, node, offset) {
-		if (curr->offset == offset) {
-			pr_info("hash table: remote addr for page offset = %lu found.\n", offset);
-			return &curr->info;
-		}
-	}
-	pr_info("hash table: did not found remote info for offset = %lu.\n", offset);
-	return 0;
-}
-*/
-
 static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	struct mcswap_tree *tree = mcswap_trees[swap_type];
-	struct mcswap_entry* rmem_node, *ent;
+	struct mcswap_entry* rmem_node;
+	// struct mcswap_entry *ent;
 	struct page_ack_req* req;
 	long wait_ret;
 	int ret;
-
-#ifdef DEBUG
-	pr_info("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
-				 ++page_cnt, swap_type, offset);
-#endif
 
 	rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
 	if (unlikely(!rmem_node)) {
@@ -453,24 +466,26 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 	ret = post_recv_page_ack_msg(req);
 	if (ret) {
 		pr_err("post_recv_page_ack_msg failed.\n");
-		return -1;
+		goto free_page_req;
 	}
 
 	// multicast the physical page to the memory servers
 	ret = swapmon_mcast_send(page, offset);
 	if (unlikely(ret)) {
 		pr_err("swapmon_mcast_send() failed.\n");
-		return -1;
+		goto free_page_req;
 	}
 
 	wait_ret = wait_for_completion_interruptible_timeout(&req->ack,
-			msecs_to_jiffies(4) + 1);
+			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
 	if (unlikely(wait_ret == -ERESTARTSYS)) {
 		pr_err("interrupted on ack waiting.\n");
-		return wait_ret;
+		ret = wait_ret;
+		goto free_page_req;
 	} else if (unlikely(wait_ret == 0)) {
 		pr_err("timed out on ack waiting.\n");
-		return -1;
+		ret = wait_ret;
+		goto free_page_req;
 	}
 
 	// once we are here we have successfully received an ACK from mem server
@@ -484,20 +499,66 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 	} else {
 #ifdef DEBUG
 		// entry was added to the remote memory mapping
-		ent = rb_find_page_remote_info(&tree->root, offset);
+		// ent = rb_find_page_remote_info(&tree->root, offset);
 		spin_unlock_bh(&tree->lock);
-		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
-				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
+		// pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
+				// page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
 #else
 		spin_unlock_bh(&tree->lock);
 #endif
   }
-	kmem_cache_free(page_ack_req_cache, req);
 
+free_page_req:
+	kmem_cache_free(page_ack_req_cache, req);
+	return ret;
+}
+
+static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
+		struct page *page) {
+	int ret;
+#ifdef BENCH
+	struct timespec ts_start, ts_end;
+	long elapsed;
+#endif
+#ifdef DEBUG
+	struct mcswap_tree *tree = mcswap_trees[swap_type];
+	struct mcswap_entry *ent;
+	pr_info("[%u] %s(swap_type = %u, offset = %lu)\n",
+				 atomic_read(&mcswap_stored_pages), __func__,
+				 swap_type, offset);
+#endif
+
+#ifdef BENCH
+	getnstimeofday(&ts_start);
+#endif
+	ret = swapmon_store_sync(swap_type, offset, page);
+	if (ret) {
+		pr_err("failed to store page with offset = %lu\n", offset);
+		return ret;
+	}
+	atomic_inc(&mcswap_stored_pages);
+#ifdef BENCH
+	getnstimeofday(&ts_end);
+	elapsed = ts_end.tv_nsec - ts_start.tv_nsec;
+	// iteratively calculate average to avoid overflow
+	mcswap_store_avg_ns += (elapsed - mcswap_store_avg_ns) /
+		atomic_read(&mcswap_stored_pages);
+#endif
+
+#ifdef DEBUG
+	// entry was added to the remote memory mapping
+	spin_lock_bh(&tree->lock);
+	ent = rb_find_page_remote_info(&tree->root, offset);
+	spin_unlock_bh(&tree->lock);
+	pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
+			atomic_read(&mcswap_stored_pages), offset, ent->info.remote_addr,
+			ent->info.rkey);
+#endif
 	return 0;
 }
 
 
+/*
 static int swapmon_store(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	struct mcswap_entry* rmem_node;
@@ -542,7 +603,6 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
-	/*
 	while (true) {
 		ret = ib_poll_cq(ctrl->send_cq, 1, &wc);
 		if (ret < 0) {
@@ -570,10 +630,10 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	}
 	pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
 			page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
-	*/
 
 	return -1;
 }
+*/
 
 struct hack_s {
 	struct ib_cqe cqe;
@@ -639,7 +699,7 @@ static int swapmon_rdma_read_sync(struct page *page,
 	}
 
 	wait_ret = wait_for_completion_interruptible_timeout(&req->done,
-			msecs_to_jiffies(4) + 1);
+			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
 	if (unlikely(wait_ret == -ERESTARTSYS)) {
 		pr_err("interrupted on ack waiting.\n");
 		return wait_ret;
@@ -652,6 +712,7 @@ static int swapmon_rdma_read_sync(struct page *page,
 }
 
 
+/*
 static int swapmon_rdma_read(struct page *page,
 		struct mcswap_entry *ent) {
 	struct ib_send_wr *bad_send_wr;
@@ -675,15 +736,6 @@ static int swapmon_rdma_read(struct page *page,
 	sge.addr = dma_addr;
 	sge.length = PAGE_SIZE;
 	sge.lkey = ctrl->pd->local_dma_lkey;
-
-	/*
-	rdma_wr.wr.wr_cqe = (struct ib_cqe *)
-		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
-	if (!rdma_wr.wr.wr_cqe) {
-		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
-		return -ENOMEM;
-	}
-	*/
 
 	rdma_wr.wr.wr_id = ent->offset;
 	rdma_wr.wr.next = NULL;
@@ -730,6 +782,7 @@ static int swapmon_rdma_read(struct page *page,
 
 	return 0;
 }
+*/
 
 static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
@@ -759,7 +812,7 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	}
 
 #ifdef DEBUG
-	pr_info("swapmon: page %lu loaded from: remote addr = %llu, rkey = %u\n",
+	pr_info("page %lu loaded from: remote addr = %llu, rkey = %u\n",
 			offset, entry->info.remote_addr, entry->info.rkey);
 #endif
 
@@ -787,8 +840,9 @@ static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
 static void swapmon_invalidate_area(unsigned swap_type) {
 	struct mcswap_tree *tree = mcswap_trees[swap_type];
 	struct mcswap_entry *curr, *tmp;
-	pr_info("swapmon: invalidate_area(swap_type = %u)\n", swap_type);
-
+#ifdef DEBUG
+	pr_info("invalidate_area(swap_type = %u)\n", swap_type);
+#endif
 	spin_lock_bh(&tree->lock);
 	rbtree_postorder_for_each_entry_safe(curr, tmp, &tree->root, node) {
 		// TODO(dimlek): the check for empty node might not be needed here.
@@ -803,14 +857,14 @@ static void swapmon_invalidate_area(unsigned swap_type) {
 	mcswap_trees[swap_type] = NULL;
 }
 
-static struct frontswap_ops swapmon_fs_ops = {
+static struct frontswap_ops mcswap_sync_ops = {
 	// prepares the device to receive frontswap pages associated with the
 	// specified swap device number (aka "type"). This function is invoked
 	// when we `swapon` a device.
 	.init  = swapmon_init,
 	// copies the page to transcendent memory and associate it with the type
 	// and offset associated with the page.
-	.store = swapmon_store_sync,
+	.store = __mcswap_store_sync,
 	// copies the page, if found, from transcendent memory into kernel memory,
 	// but will not remove the page from transcendent memory.
 	.load  = swapmon_load,
@@ -843,9 +897,9 @@ static struct ib_client swapmon_ib_client = {
 };
 */
 
-#define MAX_NR_SERVERS 3
-
 /*--------------------- Module parameters ---------------------*/
+
+#define MAX_NR_SERVERS 3
 
 static char *server[MAX_NR_SERVERS];
 static int nr_servers;
@@ -861,6 +915,13 @@ static char client_ip[INET_ADDRSTRLEN];
 module_param_string(cip, client_ip, INET_ADDRSTRLEN, 0644);
 MODULE_PARM_DESC(client_ip, "IP address in n.n.n.n form of the interface used"
 		"for communicating with the memory servers");
+
+static int enable_async_mode = 0;
+module_param(enable_async_mode, int, 0644);
+MODULE_PARM_DESC(enable_async_mode, "Enable asynchronous stores/loads "
+		"but requires appropriate kernel patch (default=0)");
+
+/*-------------------------------------------------------------*/
 
 
 static int swapmon_rdma_parse_ipaddr(struct sockaddr_in *saddr, char *ip) {
@@ -1189,6 +1250,7 @@ static int send_dummy_ud_msg(void) {
 */
 
 
+/*
 static int init_ud_comms(void) {
 	struct ib_qp_attr qp_attr;
 	struct ib_qp_init_attr qp_init_attr = {};
@@ -1266,8 +1328,7 @@ static int init_ud_comms(void) {
 	ah_attr.type = RDMA_AH_ATTR_TYPE_IB;
 
 	rdma_ah_set_grh(&ah_attr, &ctrl->server.ud_transport.gid,
-			0 /* flow_label */, sgid_index /* sgid_index */,
-			1 /* hop_limit */, 0 /* traffic_class */);
+			0, sgid_index, 1, 0);
 	rdma_ah_set_sl(&ah_attr, 0);
 	rdma_ah_set_static_rate(&ah_attr, 0);
 	rdma_ah_set_port_num(&ah_attr, ctrl->cm_id->port_num);
@@ -1285,6 +1346,7 @@ static int init_ud_comms(void) {
 	pr_info("address handle created succesfully.\n");
 	return 0;
 }
+*/
 
 
 static int send_dummy_mcast_msg(void) {
@@ -1847,13 +1909,26 @@ static int __init swapmonfs_init(void) {
 		printk("rdma connection established successfully\n");
 	}
 
-	frontswap_register_ops(&swapmon_fs_ops);
+	if (!enable_async_mode) {
+		frontswap_register_ops(&mcswap_sync_ops);
+	} else {
+		pr_err("async mode is currently not supported.\n");
+		return -1;
+	}
+
+	if (mcswap_debugfs_init()) {
+		pr_warn("debugfs initialization failed.\n");
+	}
+
 	pr_info("module loaded successfully.\n");
 	return 0;
 }
 
 static void __exit swapmonfs_exit(void) {
 	kmem_cache_destroy(mcswap_entry_cache);
+	kmem_cache_destroy(page_ack_req_cache);
+	kmem_cache_destroy(rdma_req_cache);
+
 	pr_info("module unloaded\n");
 }
 
