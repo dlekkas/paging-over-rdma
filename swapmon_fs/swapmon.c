@@ -427,8 +427,10 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 	long wait_ret;
 	int ret;
 
+#ifdef DEBUG
 	pr_info("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
 				 ++page_cnt, swap_type, offset);
+#endif
 
 	rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
 	if (unlikely(!rmem_node)) {
@@ -480,11 +482,15 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 		spin_unlock_bh(&tree->lock);
 		kmem_cache_free(mcswap_entry_cache, req->entry);
 	} else {
+#ifdef DEBUG
 		// entry was added to the remote memory mapping
 		ent = rb_find_page_remote_info(&tree->root, offset);
 		spin_unlock_bh(&tree->lock);
 		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
 				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
+#else
+		spin_unlock_bh(&tree->lock);
+#endif
   }
 	kmem_cache_free(page_ack_req_cache, req);
 
@@ -502,13 +508,6 @@ static int swapmon_store(unsigned swap_type, pgoff_t offset,
 	if (page_cnt % 64 == 0) {
 		mdelay(7);
 	}
-	/*
-	if (page_cnt >= 350) {
-		return -1;
-	} else {
-		page_cnt++;
-	}
-	*/
 
 	printk("[%u] swapmon: store(swap_type = %u, offset = %lu)\n",
 				 page_cnt, swap_type, offset);
@@ -738,8 +737,10 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	struct mcswap_entry *entry;
 	int ret;
 
+#ifdef DEBUG
 	pr_info("%s(swap_type = %u, offset = %lu)\n",
 				 __func__, swap_type, offset);
+#endif
 
 	spin_lock_bh(&tree->lock);
 	entry = rb_find_page_remote_info(&tree->root, offset);
@@ -757,16 +758,22 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 		return -1;
 	}
 
+#ifdef DEBUG
 	pr_info("swapmon: page %lu loaded from: remote addr = %llu, rkey = %u\n",
 			offset, entry->info.remote_addr, entry->info.rkey);
+#endif
+
 	return 0;
 }
 
 static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
 	struct mcswap_tree *tree = mcswap_trees[swap_type];
 	int ret;
+
+#ifdef DEBUG
 	pr_info("invalidate_page(swap_type = %u, offset = %lu)\n",
 				 swap_type, offset);
+#endif
 
 	spin_lock_bh(&tree->lock);
 	ret = mcswap_rb_erase(&tree->root, offset);
