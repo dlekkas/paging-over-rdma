@@ -42,12 +42,15 @@
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
-#define MCSWAP_PAGE_ACK_TIMEOUT_MS 4
+#define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
+#define MCSWAP_MAX_SEND_RETRIES 1
 #define UC_QKEY 0x11111111
 
 #ifdef CONFIG_DEBUG_FS
 #include <linux/debugfs.h>
 static atomic_t mcswap_stored_pages = ATOMIC_INIT(0);
+static u64 mcswap_store_timeouts = 0;
+static u64 mcswap_sent_pages = 0;
 static unsigned long mcswap_store_avg_ns= 0;
 
 static struct dentry *mcswap_debugfs_root;
@@ -64,6 +67,10 @@ static int __init mcswap_debugfs_init(void) {
 
 	debugfs_create_atomic_t("stored_pages", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_stored_pages);
+	debugfs_create_u64("store_timeouts", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_store_timeouts);
+	debugfs_create_u64("sent_pages", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_sent_pages);
 	debugfs_create_ulong("store_avg_ns", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_store_avg_ns);
 	return 0;
@@ -440,73 +447,72 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	struct mcswap_tree *tree = mcswap_trees[swap_type];
 	struct mcswap_entry* rmem_node;
-	// struct mcswap_entry *ent;
 	struct page_ack_req* req;
 	long wait_ret;
+	int retries = 0;
 	int ret;
 
-	rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
-	if (unlikely(!rmem_node)) {
-		pr_err("kzalloc failed to allocate mem for u64.\n");
-		return -ENOMEM;
-	}
-	rmem_node->offset = offset;
+	while (retries < MCSWAP_MAX_SEND_RETRIES) {
 
-	req = kmem_cache_alloc(page_ack_req_cache, GFP_KERNEL);
-	if (unlikely(!req)) {
-		pr_err("slab allocator failed to allocate mem for page_ack_req.\n");
-		return -ENOMEM;
-	}
-	req->entry = rmem_node;
-	req->cqe.done = page_ack_done_sync;
-	req->swap_type = swap_type;
-	init_completion(&req->ack);
+		rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
+		if (unlikely(!rmem_node)) {
+			pr_err("kzalloc failed to allocate mem for u64.\n");
+			return -ENOMEM;
+		}
+		rmem_node->offset = offset;
 
-	// post RR for the ACK message to be received from mem server
-	ret = post_recv_page_ack_msg(req);
-	if (ret) {
-		pr_err("post_recv_page_ack_msg failed.\n");
-		goto free_page_req;
+		req = kmem_cache_alloc(page_ack_req_cache, GFP_KERNEL);
+		if (unlikely(!req)) {
+			pr_err("slab allocator failed to allocate mem for page_ack_req.\n");
+			return -ENOMEM;
+		}
+		req->entry = rmem_node;
+		req->cqe.done = page_ack_done_sync;
+		req->swap_type = swap_type;
+		init_completion(&req->ack);
+
+		// post RR for the ACK message to be received from mem server
+		ret = post_recv_page_ack_msg(req);
+		if (ret) {
+			pr_err("post_recv_page_ack_msg failed.\n");
+			goto free_page_req;
+		}
+
+		// multicast the physical page to the memory servers
+		ret = swapmon_mcast_send(page, offset);
+		if (unlikely(ret)) {
+			pr_err("swapmon_mcast_send() failed.\n");
+			goto free_page_req;
+		}
+
+		wait_ret = wait_for_completion_interruptible_timeout(&req->ack,
+				msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
+		if (unlikely(wait_ret == -ERESTARTSYS)) {
+			pr_err("interrupted on ack waiting.\n");
+			return wait_ret;
+		} else if (unlikely(wait_ret == 0)) {
+			pr_err("timed out on ack waiting.\n");
+			mcswap_store_timeouts++;
+		} else {
+			break;
+		}
+		retries++;
 	}
 
-	// multicast the physical page to the memory servers
-	ret = swapmon_mcast_send(page, offset);
-	if (unlikely(ret)) {
-		pr_err("swapmon_mcast_send() failed.\n");
-		goto free_page_req;
-	}
-
-	wait_ret = wait_for_completion_interruptible_timeout(&req->ack,
-			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
-	if (unlikely(wait_ret == -ERESTARTSYS)) {
-		pr_err("interrupted on ack waiting.\n");
-		ret = wait_ret;
-		goto free_page_req;
-	} else if (unlikely(wait_ret == 0)) {
-		pr_err("timed out on ack waiting.\n");
-		ret = wait_ret;
-		goto free_page_req;
+	if (retries >= MCSWAP_MAX_SEND_RETRIES) {
+		pr_err("failed to send message after %d retries.\n", retries);
+		return -retries;
 	}
 
 	// once we are here we have successfully received an ACK from mem server
 	spin_lock_bh(&tree->lock);
 	ret = mcswap_rb_insert(&tree->root, req->entry);
+	spin_unlock_bh(&tree->lock);
 	if (ret) {
 		// entry already exists for this offset, so we need to release
 		// the lock and free the mcswap_entry structure here.
-		spin_unlock_bh(&tree->lock);
 		kmem_cache_free(mcswap_entry_cache, req->entry);
-	} else {
-#ifdef DEBUG
-		// entry was added to the remote memory mapping
-		// ent = rb_find_page_remote_info(&tree->root, offset);
-		spin_unlock_bh(&tree->lock);
-		// pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
-				// page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
-#else
-		spin_unlock_bh(&tree->lock);
-#endif
-  }
+	}
 
 free_page_req:
 	kmem_cache_free(page_ack_req_cache, req);
@@ -554,7 +560,7 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 			atomic_read(&mcswap_stored_pages), offset, ent->info.remote_addr,
 			ent->info.rkey);
 #endif
-	return 0;
+	return ret;
 }
 
 
