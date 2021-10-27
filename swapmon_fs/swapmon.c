@@ -43,7 +43,7 @@
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
 #define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
-#define MCSWAP_MAX_SEND_RETRIES 1
+#define MCSWAP_MAX_SEND_RETRIES 3
 #define UC_QKEY 0x11111111
 
 #ifdef CONFIG_DEBUG_FS
@@ -484,6 +484,7 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 			pr_err("swapmon_mcast_send() failed.\n");
 			goto free_page_req;
 		}
+		mcswap_sent_pages++;
 
 		wait_ret = wait_for_completion_interruptible_timeout(&req->ack,
 				msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
@@ -549,6 +550,9 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 	// iteratively calculate average to avoid overflow
 	mcswap_store_avg_ns += (elapsed - mcswap_store_avg_ns) /
 		atomic_read(&mcswap_stored_pages);
+	if (atomic_read(&mcswap_stored_pages) % 1024 == 0) {
+		pr_info("elapsed: %u\n", elapsed);
+	}
 #endif
 
 #ifdef DEBUG

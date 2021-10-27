@@ -18,6 +18,10 @@
 #include <cerrno>
 #include <chrono>
 #include <thread>
+#include <numeric>
+#include <algorithm>
+#include <unordered_map>
+#include <fstream>
 
 #define MAX_QUEUED_CONNECT_REQUESTS 2
 #define UD_QKEY 0x11111111
@@ -30,6 +34,8 @@ constexpr std::size_t BUFFER_SIZE(32 * 4096 * 4096);
 constexpr int MIN_CQE(8192);
 
 int outstanding_cqe = 0;
+int n_sent_acks = 0;
+int n_recv_pages = 0;
 
 
 enum comm_ctrl_opcode {
@@ -129,6 +135,7 @@ class ServerRDMA {
 	struct ibv_srq *srq_;
 
 	struct ibv_mr *mr_;
+	struct ibv_mr *grh_mr_;
 
 	struct ibv_pd *pd_;
 
@@ -139,6 +146,8 @@ class ServerRDMA {
 	struct ibv_qp *mcast_qp_;
 
 	struct sockaddr src_addr_;
+
+	struct sockaddr *mcast_addr_;
 
 	char *mcast_msg;
 
@@ -658,6 +667,7 @@ void ServerRDMA::join_mcast_group() {
 	if (rdma_getaddrinfo(mcast_addr_str.c_str(), NULL, &hints, &addrinfo)) {
 		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
 	}
+	mcast_addr_ = addrinfo->ai_dst_addr;
 
 	struct rdma_cm_join_mc_attr_ex mc_join_attr;
 	mc_join_attr.comp_mask = RDMA_CM_JOIN_MC_ATTR_ADDRESS |
@@ -822,19 +832,17 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 	// multicast messages. `ibv_alloc_null_mr` is only supported in MLX5
 	// so we have to register some "null" memory regions ourselves.
 	void* grh_sink = malloc(sizeof(struct ibv_grh));
-
-	struct ibv_mr *grh_mr;
-	grh_mr = ibv_reg_mr(pd_, grh_sink, sizeof(struct ibv_grh),
+	grh_mr_ = ibv_reg_mr(pd_, grh_sink, sizeof(struct ibv_grh),
 			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-	if (!grh_mr) {
+	if (!grh_mr_) {
 		std::cerr << "ibv_reg_mr for GRH headers failed.\n";
 		return -1;
 	}
 
 	// sge for keeping the GRH
-	sge[0].addr = reinterpret_cast<uint64_t>(grh_mr->addr);
+	sge[0].addr = reinterpret_cast<uint64_t>(grh_mr_->addr);
 	sge[0].length = sizeof(struct ibv_grh);
-	sge[0].lkey = grh_mr->lkey;
+	sge[0].lkey = grh_mr_->lkey;
 
 	int max_wrs = BUFFER_SIZE / 4096;
 
@@ -905,6 +913,10 @@ int ServerRDMA::Poll(int timeout_s) {
 	}
 	std::cout << "max RRs = " << dev_attr.max_qp_wr << "\n";
 
+	std::vector<double> times;
+	std::unordered_map<uint32_t, std::chrono::time_point<
+		std::chrono::high_resolution_clock>> pg_times_map;
+
 	// Post as many RRs in the work queue as possible in order to avoid doing it
 	// when flooded by incoming pages.
 	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr);
@@ -935,9 +947,14 @@ int ServerRDMA::Poll(int timeout_s) {
 				if (wc[i].wc_flags & IBV_WC_WITH_IMM) {
 					cnt++;
 					n_posted_recvs_--;
+					/*
 					std::cout << cnt << " Remote page with id = " << page_id <<
 						" stored at addr = " << page_store_addr << "\n";
+					*/
+					n_recv_pages++;
+					auto t1 = std::chrono::high_resolution_clock::now();
 					send_ack(page_id, page_store_addr, mr_->rkey);
+					pg_times_map.insert({page_id, t1});
 				}
 			} else {
 				std::cerr << "Polling failed with status "
@@ -974,19 +991,84 @@ int ServerRDMA::Poll(int timeout_s) {
 			if (wc[i].status != IBV_WC_SUCCESS) {
 				std::cerr << "ACK message failure.\n";
 			} else {
-				std::cout << "ACK received for page with id = "
-					<< wc[i].wr_id << "\n";
+				auto t1 = pg_times_map.find(wc[i].wr_id);
+				auto t2 = std::chrono::high_resolution_clock::now();
+				auto elapsed_us = std::chrono::duration_cast<
+					std::chrono::nanoseconds>(t2 - (t1->second));
+				times.push_back(elapsed_us.count() / 1000.0);
+				n_sent_acks++;
+				// std::cout << "ACK received for page with id = "
+					// << wc[i].wr_id << "\n";
 			}
 		}
 	}
+
+	auto total = std::accumulate(times.begin(), times.end(), 0);
+	auto avg = (1.0 * total) / times.size();
+	auto min_val = *std::min_element(times.begin(), times.end());
+	auto max_val = *std::max_element(times.begin(), times.end());
+
+	// std::cout << "Num ACK sent: " << times.size() << std::endl;
+	std::cout << "Num ACK sent: " << n_sent_acks << std::endl;
+	std::cout << "Num pages received: " << n_recv_pages << std::endl;
+	std::cout << "Avg ACK time: " << avg << "[us]" << std::endl;
+	std::cout << "Min ACK time: " << min_val << std::endl;
+	std::cout << "Max ACK time: " << max_val << std::endl;
+
+	std::ofstream outf{"times.txt"};
+	for (const auto &e: times) { outf << e << "\n"; }
+
 	return 0;
 }
 
 
 ServerRDMA::~ServerRDMA() {
+	if (rdma_leave_multicast(mcast_cm_id_, mcast_addr_)) {
+		std::cerr << "rdma_leave_multicast failed: " <<
+			std::strerror(errno) << "\n";
+	}
+
 	if (mr_ != nullptr) {
 		if (ibv_dereg_mr(mr_)) {
 			std::cerr << "ibv_dereg_mr failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	if (grh_mr_ != nullptr) {
+		if (ibv_dereg_mr(grh_mr_)) {
+			std::cerr << "ibv_dereg_mr failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	if (rc_qp_ != nullptr) {
+		rdma_destroy_qp(cm_id_);
+	}
+
+	if (mcast_qp_ != nullptr) {
+		rdma_destroy_qp(mcast_cm_id_);
+	}
+
+	if (ud_qp_ != nullptr) {
+		if (ibv_destroy_qp(ud_qp_)) {
+			std::cerr << "ibv_destroy_qp failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	if (cq_ != nullptr) {
+		if (ibv_destroy_cq(cq_)) {
+			std::cerr << "ibv_destroy_cq failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	if (mcast_cq_ != nullptr) {
+		if (ibv_destroy_cq(mcast_cq_)) {
+			std::cerr << "ibv_destroy_cq failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	if (srq_ != nullptr) {
+		if (ibv_destroy_srq(srq_)) {
+			std::cerr << "ibv_destroy_srq failed: " << std::strerror(errno) << "\n";
 		}
 	}
 
@@ -1000,6 +1082,13 @@ ServerRDMA::~ServerRDMA() {
 	if (cm_id_ != nullptr) {
 		// Any associated QP must be freed before destroying the CM ID.
 		if (rdma_destroy_id(cm_id_)) {
+			std::cerr << "rdma_destroy_id failed: " << std::strerror(errno) << "\n";
+		}
+	}
+
+	if (mcast_cm_id_ != nullptr) {
+		// Any associated QP must be freed before destroying the CM ID.
+		if (rdma_destroy_id(mcast_cm_id_)) {
 			std::cerr << "rdma_destroy_id failed: " << std::strerror(errno) << "\n";
 		}
 	}
