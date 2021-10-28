@@ -48,10 +48,14 @@
 
 #ifdef CONFIG_DEBUG_FS
 #include <linux/debugfs.h>
+
 static atomic_t mcswap_stored_pages = ATOMIC_INIT(0);
+static atomic_t mcswap_loaded_pages = ATOMIC_INIT(0);
 static u64 mcswap_store_timeouts = 0;
 static u64 mcswap_sent_pages = 0;
 static unsigned long mcswap_store_avg_ns= 0;
+static u32 mcswap_store_times[128*1024];
+static u32 mcswap_load_times[128*1024];
 
 static struct dentry *mcswap_debugfs_root;
 
@@ -67,12 +71,18 @@ static int __init mcswap_debugfs_init(void) {
 
 	debugfs_create_atomic_t("stored_pages", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_stored_pages);
+	debugfs_create_atomic_t("loaded_pages", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_loaded_pages);
 	debugfs_create_u64("store_timeouts", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_store_timeouts);
 	debugfs_create_u64("sent_pages", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_sent_pages);
 	debugfs_create_ulong("store_avg_ns", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_store_avg_ns);
+	debugfs_create_u32_array("store_measure_ns", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_store_times[0], 128*1024);
+	debugfs_create_u32_array("load_measure_ns", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_load_times[0], 128*1024);
 	return 0;
 }
 #else
@@ -525,6 +535,7 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 	int ret;
 #ifdef BENCH
 	struct timespec ts_start, ts_end;
+	int n_pages = atomic_read(&mcswap_stored_pages);
 	long elapsed;
 #endif
 #ifdef DEBUG
@@ -548,11 +559,8 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 	getnstimeofday(&ts_end);
 	elapsed = ts_end.tv_nsec - ts_start.tv_nsec;
 	// iteratively calculate average to avoid overflow
-	mcswap_store_avg_ns += (elapsed - mcswap_store_avg_ns) /
-		atomic_read(&mcswap_stored_pages);
-	if (atomic_read(&mcswap_stored_pages) % 1024 == 0) {
-		pr_info("elapsed: %u\n", elapsed);
-	}
+	mcswap_store_avg_ns += (elapsed - mcswap_store_avg_ns) / (n_pages + 1);
+	mcswap_store_times[n_pages % (128 * 1024)] = elapsed;
 #endif
 
 #ifdef DEBUG
@@ -800,11 +808,6 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	struct mcswap_entry *entry;
 	int ret;
 
-#ifdef DEBUG
-	pr_info("%s(swap_type = %u, offset = %lu)\n",
-				 __func__, swap_type, offset);
-#endif
-
 	spin_lock_bh(&tree->lock);
 	entry = rb_find_page_remote_info(&tree->root, offset);
 	if (!entry) {
@@ -814,20 +817,52 @@ static int swapmon_load(unsigned swap_type, pgoff_t offset,
 	}
 	spin_unlock_bh(&tree->lock);
 
-	// ret = swapmon_rdma_read(page, entry);
 	ret = swapmon_rdma_read_sync(page, entry);
 	if (unlikely(ret)) {
 		pr_info("failed to fetch remote page.\n");
 		return -1;
 	}
 
-#ifdef DEBUG
-	pr_info("page %lu loaded from: remote addr = %llu, rkey = %u\n",
-			offset, entry->info.remote_addr, entry->info.rkey);
-#endif
-
 	return 0;
 }
+
+static int __mcswap_load_sync(unsigned swap_type, pgoff_t offset,
+		struct page *page) {
+	int ret;
+#ifdef BENCH
+	struct timespec ts_start, ts_end;
+	int n_pages = atomic_read(&mcswap_loaded_pages);
+	long elapsed;
+#endif
+#ifdef DEBUG
+	struct mcswap_tree *tree = mcswap_trees[swap_type];
+	struct mcswap_entry *ent;
+	pr_info("[%u] %s(swap_type = %u, offset = %lu)\n",
+				 atomic_read(&mcswap_loaded_pages), __func__,
+				 swap_type, offset);
+#endif
+#ifdef BENCH
+	getnstimeofday(&ts_start);
+#endif
+	ret = swapmon_load(swap_type, offset, page);
+	if (unlikely(ret)) {
+		pr_info("failed to load page with offset = %lu\n", offset);
+		return ret;
+	}
+	atomic_inc(&mcswap_loaded_pages);
+#ifdef BENCH
+	getnstimeofday(&ts_end);
+	elapsed = ts_end.tv_nsec - ts_start.tv_nsec;
+	mcswap_load_times[n_pages % (128 * 1024)] = elapsed;
+#endif
+#ifdef DEBUG
+	pr_info("[%u] page %lu loaded from: remote addr = %llu, rkey = %u\n",
+			atomic_read(&mcswap_loaded_pages), offset, entry->info.remote_addr,
+			entry->info.rkey);
+#endif
+	return 0;
+}
+
 
 static void swapmon_invalidate_page(unsigned swap_type, pgoff_t offset) {
 	struct mcswap_tree *tree = mcswap_trees[swap_type];
@@ -877,7 +912,7 @@ static struct frontswap_ops mcswap_sync_ops = {
 	.store = __mcswap_store_sync,
 	// copies the page, if found, from transcendent memory into kernel memory,
 	// but will not remove the page from transcendent memory.
-	.load  = swapmon_load,
+	.load  = __mcswap_load_sync,
 	// removes the page from transcendent memory.
 	.invalidate_page = swapmon_invalidate_page,
 	// removes all pages from transcendent memory.
