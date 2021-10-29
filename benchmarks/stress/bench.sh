@@ -29,10 +29,22 @@ fi
 # build benchmark cpp program
 make
 
-mkdir -p ${RESULTS_DIR}
-ts=`date +"%d%m.%H%M%S"`
-res_file=${RESULTS_DIR}/exec_times_${n_mbs}_${ts}.raw
-for i in $( seq 1 ${n_res} ); do
+ts=`date +%Y-%m-%dT%H-%M-%S`
+res_dir=${RESULTS_DIR}/${ts}
+mkdir -p ${res_dir}
+res_file=${res_dir}/app_exec_times_${n_mbs}.raw
+for i in $( seq 1 ${n_reps} ); do
 	sudo cgexec -g memory:${CGROUP_NAME} ./example ${n_mbs} >> ${res_file}
 done
 
+pushd ${res_dir}
+sudo cp /sys/kernel/debug/mcswap/store_measure_us store_latencies
+sudo cp /sys/kernel/debug/mcswap/load_measure_us load_latencies
+sudo chown $USER:$USER store_latencies load_latencies
+scp dilekkas@lenovo.inf.ethz.ch:~/paging-over-rdma/mem_server/times.txt ack_latencies
+popd
+python3 ../measure.py --ack-latencies-file ${res_dir}/ack_latencies \
+	--store-latencies-file ${res_dir}/store_latencies \
+	--load-latencies-file ${res_dir}/load_latencies > ${res_dir}/statistics
+
+make clean
