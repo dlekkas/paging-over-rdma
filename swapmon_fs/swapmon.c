@@ -42,8 +42,10 @@
 
 #define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define SWAPMON_MCAST_JOIN_TIMEOUT_MS 5000
-#define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
+#define MCSWAP_PAGE_ACK_TIMEOUT_MS 2
 #define MCSWAP_MAX_SEND_RETRIES 3
+
+#define MAX_LOG_TIME_ENTRIES 120000
 #define UC_QKEY 0x11111111
 
 #ifdef CONFIG_DEBUG_FS
@@ -54,8 +56,8 @@ static atomic_t mcswap_loaded_pages = ATOMIC_INIT(0);
 static u64 mcswap_store_timeouts = 0;
 static u64 mcswap_sent_pages = 0;
 static unsigned long mcswap_store_avg_ns= 0;
-static u32 mcswap_store_times[128*1024];
-static u32 mcswap_load_times[128*1024];
+static u32 mcswap_store_times[MAX_LOG_TIME_ENTRIES];
+static u32 mcswap_load_times[MAX_LOG_TIME_ENTRIES];
 
 static struct dentry *mcswap_debugfs_root;
 
@@ -79,10 +81,10 @@ static int __init mcswap_debugfs_init(void) {
 			mcswap_debugfs_root, &mcswap_sent_pages);
 	debugfs_create_ulong("store_avg_ns", S_IRUGO,
 			mcswap_debugfs_root, &mcswap_store_avg_ns);
-	debugfs_create_u32_array("store_measure_ns", S_IRUGO,
-			mcswap_debugfs_root, &mcswap_store_times[0], 128*1024);
-	debugfs_create_u32_array("load_measure_ns", S_IRUGO,
-			mcswap_debugfs_root, &mcswap_load_times[0], 128*1024);
+	debugfs_create_u32_array("store_measure_us", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_store_times[0], MAX_LOG_TIME_ENTRIES);
+	debugfs_create_u32_array("load_measure_us", S_IRUGO,
+			mcswap_debugfs_root, &mcswap_load_times[0], MAX_LOG_TIME_ENTRIES);
 	return 0;
 }
 #else
@@ -560,7 +562,7 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 	elapsed = ts_end.tv_nsec - ts_start.tv_nsec;
 	// iteratively calculate average to avoid overflow
 	mcswap_store_avg_ns += (elapsed - mcswap_store_avg_ns) / (n_pages + 1);
-	mcswap_store_times[n_pages % (128 * 1024)] = elapsed;
+	mcswap_store_times[n_pages % MAX_LOG_TIME_ENTRIES] = elapsed;
 #endif
 
 #ifdef DEBUG
@@ -853,7 +855,7 @@ static int __mcswap_load_sync(unsigned swap_type, pgoff_t offset,
 #ifdef BENCH
 	getnstimeofday(&ts_end);
 	elapsed = ts_end.tv_nsec - ts_start.tv_nsec;
-	mcswap_load_times[n_pages % (128 * 1024)] = elapsed;
+	mcswap_load_times[n_pages % MAX_LOG_TIME_ENTRIES] = elapsed;
 #endif
 #ifdef DEBUG
 	pr_info("[%u] page %lu loaded from: remote addr = %llu, rkey = %u\n",

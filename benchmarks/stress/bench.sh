@@ -39,8 +39,10 @@ done
 
 pushd ${res_dir}
 sudo cp /sys/kernel/debug/mcswap/store_measure_us store_latencies
+sudo cp /sys/kernel/debug/mcswap/stored_pages stored_pages
 sudo cp /sys/kernel/debug/mcswap/load_measure_us load_latencies
-sudo chown $USER:$USER store_latencies load_latencies
+sudo cp /sys/kernel/debug/mcswap/loaded_pages loaded_pages
+sudo chown $USER:$USER store_latencies load_latencies stored_pages loaded_pages
 scp dilekkas@lenovo.inf.ethz.ch:~/paging-over-rdma/mem_server/times.txt ack_latencies
 popd
 python3 ../measure.py --ack-latencies-file ${res_dir}/ack_latencies \

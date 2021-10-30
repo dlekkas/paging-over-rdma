@@ -28,7 +28,7 @@
 #define IBV_DEFAULT_PKEY_FULL 0xFFFF
 
 // Memory size allocated for remote peers.
-constexpr std::size_t BUFFER_SIZE(32 * 4096 * 4096);
+constexpr std::size_t BUFFER_SIZE(120 * 4096 * 4096);
 
 // Completion Queue (CQ) will contain at least `MIN_CQE` entries.
 constexpr int MIN_CQE(8192);
@@ -849,7 +849,7 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 	struct ibv_recv_wr wr, *bad_wr;
 	for (int i = 0; i < std::min(n_wrs, max_wrs); i++) {
 		uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) +
-			(curr_idx_ + i) * 4096;
+			((curr_idx_ + i) % (120 * 4096)) * 4096;
 		// sge for storing the remote page
 		sge[1].addr = page_addr;
 		sge[1].length = 4096;
@@ -964,23 +964,6 @@ int ServerRDMA::Poll(int timeout_s) {
 			}
 		}
 
-		// if ((n_wrs < 16) && (n_posted_recvs_ < 8192 - 64)) {
-		if ((n_posted_recvs_ < 4096)) {
-			// TODO(dimlek): What is a good number of recv requests to post here?
-			// We don't want to post a lot due to risk of increasing backpressure.
-			succ_posts = post_page_recv_requests(mcast_qp_, 32);
-			n_posted_recvs_ += succ_posts;
-			curr_idx_ += succ_posts;
-		} else if (n_posted_recvs_ < 512) {
-			// we need to post pages urgently to avoid receiving message without
-			// having a posted WR ready
-			std::cout << "Running low on posted recvs: "
-				<< n_posted_recvs_ << "\n";
-			succ_posts = post_page_recv_requests(mcast_qp_, 128);
-			n_posted_recvs_ += succ_posts;
-			curr_idx_ += succ_posts;
-		}
-
 		int rc_wrs = ibv_poll_cq(cq_, 64, wc);
 		outstanding_cqe -= rc_wrs;
 		for (int i = 0; i < rc_wrs; i++) {
@@ -1001,6 +984,23 @@ int ServerRDMA::Poll(int timeout_s) {
 					// << wc[i].wr_id << "\n";
 			}
 		}
+
+		// if ((n_wrs < 16) && (n_posted_recvs_ < 8192 - 64)) {
+		if ((n_posted_recvs_ < 4096)) {
+			// TODO(dimlek): What is a good number of recv requests to post here?
+			// We don't want to post a lot due to risk of increasing backpressure.
+			succ_posts = post_page_recv_requests(mcast_qp_, 32);
+			n_posted_recvs_ += succ_posts;
+			curr_idx_ += succ_posts;
+		} else if (n_posted_recvs_ < 512) {
+			// we need to post pages urgently to avoid receiving message without
+			// having a posted WR ready
+			std::cout << "Running low on posted recvs: "
+				<< n_posted_recvs_ << "\n";
+			succ_posts = post_page_recv_requests(mcast_qp_, 128);
+			n_posted_recvs_ += succ_posts;
+			curr_idx_ += succ_posts;
+		}
 	}
 
 	auto total = std::accumulate(times.begin(), times.end(), 0);
@@ -1008,7 +1008,6 @@ int ServerRDMA::Poll(int timeout_s) {
 	auto min_val = *std::min_element(times.begin(), times.end());
 	auto max_val = *std::max_element(times.begin(), times.end());
 
-	// std::cout << "Num ACK sent: " << times.size() << std::endl;
 	std::cout << "Num ACK sent: " << n_sent_acks << std::endl;
 	std::cout << "Num pages received: " << n_recv_pages << std::endl;
 	std::cout << "Avg ACK time: " << avg << "[us]" << std::endl;
@@ -1044,9 +1043,11 @@ ServerRDMA::~ServerRDMA() {
 		rdma_destroy_qp(cm_id_);
 	}
 
+	/*
 	if (mcast_qp_ != nullptr) {
 		rdma_destroy_qp(mcast_cm_id_);
 	}
+	*/
 
 	if (ud_qp_ != nullptr) {
 		if (ibv_destroy_qp(ud_qp_)) {
@@ -1116,8 +1117,8 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Polling for 40sec." << std::endl;
-	server.Poll(40);
+	std::cout << "Polling for 120sec." << std::endl;
+	server.Poll(120);
 
 	return 0;
 }
