@@ -37,17 +37,19 @@ def outlier_aware_hist(data, lower=None, upper=None):
 
 def add_row(table, row_name, latencies):
     table.append_row([row_name, '{:.2f}'.format(min(latencies)),
+        '{:.2f}'.format(np.mean(latencies)),
         '{:.2f}'.format(np.percentile(latencies, 50)),
         '{:.2f}'.format(np.percentile(latencies, 90)),
         '{:.2f}'.format(np.percentile(latencies, 99)),
         '{:.2f}'.format(np.percentile(latencies, 99.9)),
+        '{:.2f}'.format(np.percentile(latencies, 99.99)),
         '{:.2f}'.format(max(latencies))])
     return
 
 def main(ack_latencies_file, store_latencies_file, load_latencies_file):
     table = BeautifulTable()
-    table.column_headers = ['', 'min [us]', 'median [us]',
-            'p90 [us]', 'p99 [us]', 'p99.9 [us]', 'max [us]']
+    table.column_headers = ['', 'avg [us]', 'min [us]', 'median [us]',
+            'p90 [us]', 'p99 [us]', 'p99.9 [us]',  'p99.99', 'max [us]']
 
     if ack_latencies_file is not None:
         ack_latencies = np.loadtxt(ack_latencies_file, delimiter='\n')

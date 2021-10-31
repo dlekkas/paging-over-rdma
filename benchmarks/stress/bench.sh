@@ -5,12 +5,11 @@ CGROUP_NAME=stretch
 CGROUP_MEM_BYTES=$((300*1024*1024)) # 300 MB
 RESULTS_DIR=./results
 
-if [ "$#" -ne 2 ]; then
-	echo "Usage: ./bench.sh <working-set MBs> <n-reps>"
+if [ "$#" -ne 1 ]; then
+	echo "Usage: ./bench.sh <n-reps>"
 	exit 1
 fi
-n_mbs=$1
-n_reps=$2
+n_reps=$1
 
 # check whether swapping is enabled and if not then enable
 # the swap partition appropriately.
@@ -30,23 +29,58 @@ fi
 make
 
 ts=`date +%Y-%m-%dT%H-%M-%S`
-res_dir=${RESULTS_DIR}/${ts}
+
+# benchmark application without any swap activity
+res_dir=${RESULTS_DIR}/${ts}/noswap
 mkdir -p ${res_dir}
-res_file=${res_dir}/app_exec_times_${n_mbs}.raw
-for i in $( seq 1 ${n_reps} ); do
-	sudo cgexec -g memory:${CGROUP_NAME} ./example ${n_mbs} >> ${res_file}
+
+res_file=${res_dir}/app_exec_times.csv
+for n_mbs in $( seq 300 100 700 ); do
+	for i in $( seq 1 ${n_reps} ); do
+		exec_time=`./example ${n_mbs}`
+		echo "${exec_time},${n_mbs}" >> ${res_file}
+	done
+done
+
+# benchmark application using the classic swap using disk
+res_dir=${RESULTS_DIR}/${ts}/swap
+mkdir -p ${res_dir}
+
+res_file=${res_dir}/app_exec_times.csv
+for n_mbs in $( seq 300 100 700 ); do
+	for i in $( seq 1 ${n_reps} ); do
+		exec_time=`sudo cgexec -g memory:${CGROUP_NAME} ./example ${n_mbs}`
+		echo "${exec_time},${n_mbs}" >> ${res_file}
+	done
+done
+
+# load mcswap module
+pushd ../../swapmon_fs
+./run.sh
+popd
+
+# benchmark application using mcswap
+res_dir=${RESULTS_DIR}/${ts}/mcswap
+mkdir -p ${res_dir}
+
+res_file=${res_dir}/app_exec_times.csv
+for n_mbs in $( seq 300 100 700 ); do
+	for i in $( seq 1 ${n_reps} ); do
+		exec_time=`sudo cgexec -g memory:${CGROUP_NAME} ./example ${n_mbs}`
+		echo "${exec_time},${n_mbs}" >> ${res_file}
+	done
 done
 
 pushd ${res_dir}
-sudo cp /sys/kernel/debug/mcswap/store_measure_us store_latencies
-sudo cp /sys/kernel/debug/mcswap/stored_pages stored_pages
-sudo cp /sys/kernel/debug/mcswap/load_measure_us load_latencies
-sudo cp /sys/kernel/debug/mcswap/loaded_pages loaded_pages
-sudo chown $USER:$USER store_latencies load_latencies stored_pages loaded_pages
-scp dilekkas@lenovo.inf.ethz.ch:~/paging-over-rdma/mem_server/times.txt ack_latencies
+#sudo cp /sys/kernel/debug/mcswap/store_measure_us store_latencies
+#sudo cp /sys/kernel/debug/mcswap/stored_pages stored_pages
+#sudo cp /sys/kernel/debug/mcswap/load_measure_us load_latencies
+#sudo cp /sys/kernel/debug/mcswap/loaded_pages loaded_pages
+#sudo chown $USER:$USER store_latencies load_latencies stored_pages loaded_pages
+#scp dilekkas@lenovo.inf.ethz.ch:~/paging-over-rdma/mem_server/times.txt ack_latencies
 popd
-python3 ../measure.py --ack-latencies-file ${res_dir}/ack_latencies \
-	--store-latencies-file ${res_dir}/store_latencies \
-	--load-latencies-file ${res_dir}/load_latencies > ${res_dir}/statistics
+#python3 ../measure.py --ack-latencies-file ${res_dir}/ack_latencies \
+	#--store-latencies-file ${res_dir}/store_latencies \
+	#--load-latencies-file ${res_dir}/load_latencies > ${res_dir}/statistics
 
 make clean
