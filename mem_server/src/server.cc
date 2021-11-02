@@ -27,6 +27,8 @@
 #define UD_QKEY 0x11111111
 #define IBV_DEFAULT_PKEY_FULL 0xFFFF
 
+#define BATCH_SZ 16
+
 // Memory size allocated for remote peers.
 constexpr std::size_t BUFFER_SIZE(120 * 4096 * 4096);
 
@@ -119,6 +121,7 @@ class ServerRDMA {
 	int extract_pkey_index(uint8_t port_num, __be16 pkey);
 
 	int post_page_recv_requests(struct ibv_qp *qp, int num_reqs);
+	int post_page_recv_requests_fast(struct ibv_qp *qp, int num_reqs, int blk_sz);
 
 	// Event channel used to report communication events.
 	struct rdma_event_channel *ev_channel_;
@@ -564,9 +567,7 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			} else {
 				std::cout << "Attached to mcast group successfully.\n";
 			}
-
 			send_control_msg(MCAST_MEMBERSHIP_ACK);
-
 			n_conns_++;
 			break;
 		case RDMA_CM_EVENT_MULTICAST_ERROR:
@@ -826,8 +827,6 @@ int ServerRDMA::WaitForClients(int n_clients) {
 }
 
 int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
-	struct ibv_sge sge[2];
-
 	// Here, we allocate some memory to store the GRH header of incoming
 	// multicast messages. `ibv_alloc_null_mr` is only supported in MLX5
 	// so we have to register some "null" memory regions ourselves.
@@ -840,6 +839,7 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 	}
 
 	// sge for keeping the GRH
+	struct ibv_sge sge[2];
 	sge[0].addr = reinterpret_cast<uint64_t>(grh_mr_->addr);
 	sge[0].length = sizeof(struct ibv_grh);
 	sge[0].lkey = grh_mr_->lkey;
@@ -868,6 +868,50 @@ int ServerRDMA::post_page_recv_requests(struct ibv_qp* qp, int n_wrs) {
 
 	return n_wrs;
 }
+
+int ServerRDMA::post_page_recv_requests_fast(struct ibv_qp* qp,
+		int n_wrs, int blk_sz) {
+	if (!grh_mr_) {
+		std::cerr << "no memory region registered to store GRH\n";
+		return -1;
+	}
+
+	// sge for keeping the GRH
+	struct ibv_sge sge[2 * blk_sz];
+	struct ibv_recv_wr wr[blk_sz];
+	for (int i = 0; i < blk_sz; i++) {
+		sge[2*i].addr = reinterpret_cast<uint64_t>(grh_mr_->addr);
+		sge[2*i].length = sizeof(struct ibv_grh);
+		sge[2*i].lkey = grh_mr_->lkey;
+
+		wr[i].next = (i+1 < blk_sz) ? &wr[i+1] : NULL;
+		wr[i].sg_list = &sge[2*i];
+		wr[i].num_sge = 2;
+	}
+
+	struct ibv_recv_wr *bad_wr;
+
+	int n_batches = n_wrs / blk_sz + (n_wrs % blk_sz == 0);
+	for (int i = 0; i < n_batches; i++) {
+		for (int j = 0; j < blk_sz; j++) {
+			uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) +
+				((curr_idx_ + (i * blk_sz + j)) % (120 * 4096)) * 4096;
+			wr[j].wr_id = page_addr;
+			sge[2*j + 1].addr = page_addr;
+			sge[2*j + 1].length = 4096;
+			sge[2*j + 1].lkey = mr_->lkey;
+		}
+
+		int ret = ibv_post_recv(qp, &wr[0], &bad_wr);
+		if (ret) {
+			std::cerr << "ibv_post_recv for page failed.\n";
+			return i * blk_sz;
+		}
+	}
+
+	return n_batches * blk_sz;
+}
+
 
 void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 	struct {
@@ -903,8 +947,9 @@ void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 }
 
 int ServerRDMA::Poll(int timeout_s) {
-	auto end = std::chrono::system_clock::now() +
-		std::chrono::seconds(timeout_s);
+	std::vector<double> times;
+	std::unordered_map<uint32_t, std::chrono::time_point<
+		std::chrono::high_resolution_clock>> pg_times_map;
 
 	struct ibv_device_attr dev_attr;
 	if (ibv_query_device(pd_->context, &dev_attr)) {
@@ -913,20 +958,28 @@ int ServerRDMA::Poll(int timeout_s) {
 	}
 	std::cout << "max RRs = " << dev_attr.max_qp_wr << "\n";
 
-	std::vector<double> times;
-	std::unordered_map<uint32_t, std::chrono::time_point<
-		std::chrono::high_resolution_clock>> pg_times_map;
+	// Here, we allocate some memory to store the GRH header of incoming
+	// multicast messages. `ibv_alloc_null_mr` is only supported in MLX5
+	// so we have to register some "null" memory regions ourselves.
+	void* grh_sink = malloc(sizeof(struct ibv_grh));
+	grh_mr_ = ibv_reg_mr(pd_, grh_sink, sizeof(struct ibv_grh),
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+	if (!grh_mr_) {
+		std::cerr << "ibv_reg_mr for GRH headers failed.\n";
+		return -1;
+	}
 
 	// Post as many RRs in the work queue as possible in order to avoid doing it
 	// when flooded by incoming pages.
 	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr);
-	int succ_posts = post_page_recv_requests(mcast_qp_, 8192);
-	n_posted_recvs_ += succ_posts;
+	int succ_posts = post_page_recv_requests_fast(mcast_qp_, 8192, BATCH_SZ);
 	curr_idx_ += succ_posts;
+	n_posted_recvs_ = curr_idx_;
 	std::cout << "Posted " << n_posted_recvs_ << " RRs for pages.\n";
 
-	int cnt = 0;
 	// Loop until timeout and poll for work completions (i.e. received pages).
+	auto end = std::chrono::system_clock::now() +
+		std::chrono::seconds(timeout_s);
 	while (std::chrono::system_clock::now() <= end) {
 		struct ibv_wc wc[64];
 		int n_wrs = ibv_poll_cq(mcast_cq_, 64, wc);
@@ -945,10 +998,9 @@ int ServerRDMA::Poll(int timeout_s) {
 				uint64_t page_store_addr = wc[i].wr_id;
 				uint32_t page_id = ntohl(wc[i].imm_data);
 				if (wc[i].wc_flags & IBV_WC_WITH_IMM) {
-					cnt++;
 					n_posted_recvs_--;
 					/*
-					std::cout << cnt << " Remote page with id = " << page_id <<
+					std::cout << " Remote page with id = " << page_id <<
 						" stored at addr = " << page_store_addr << "\n";
 					*/
 					n_recv_pages++;
@@ -985,19 +1037,17 @@ int ServerRDMA::Poll(int timeout_s) {
 			}
 		}
 
-		// if ((n_wrs < 16) && (n_posted_recvs_ < 8192 - 64)) {
-		if ((n_posted_recvs_ < 4096)) {
+		if ((n_posted_recvs_ < 8192-32)) {
 			// TODO(dimlek): What is a good number of recv requests to post here?
 			// We don't want to post a lot due to risk of increasing backpressure.
-			succ_posts = post_page_recv_requests(mcast_qp_, 32);
+			succ_posts = post_page_recv_requests_fast(mcast_qp_, 32, BATCH_SZ);
 			n_posted_recvs_ += succ_posts;
 			curr_idx_ += succ_posts;
 		} else if (n_posted_recvs_ < 512) {
 			// we need to post pages urgently to avoid receiving message without
 			// having a posted WR ready
-			std::cout << "Running low on posted recvs: "
-				<< n_posted_recvs_ << "\n";
-			succ_posts = post_page_recv_requests(mcast_qp_, 128);
+			std::cout << "Running low on posted recvs: " << n_posted_recvs_ << "\n";
+			succ_posts = post_page_recv_requests_fast(mcast_qp_, 128, BATCH_SZ);
 			n_posted_recvs_ += succ_posts;
 			curr_idx_ += succ_posts;
 		}
