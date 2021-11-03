@@ -904,7 +904,8 @@ int ServerRDMA::post_page_recv_requests_fast(struct ibv_qp* qp,
 
 		int ret = ibv_post_recv(qp, &wr[0], &bad_wr);
 		if (ret) {
-			std::cerr << "ibv_post_recv for page failed.\n";
+			std::cerr << "ibv_post_recv for page failed: " <<
+				std::strerror(ret) << "\n";
 			return i * blk_sz;
 		}
 	}
@@ -972,7 +973,7 @@ int ServerRDMA::Poll(int timeout_s) {
 	// Post as many RRs in the work queue as possible in order to avoid doing it
 	// when flooded by incoming pages.
 	// int succ_posts = post_page_recv_requests(mcast_qp_, dev_attr.max_qp_wr);
-	int succ_posts = post_page_recv_requests_fast(mcast_qp_, 8192, BATCH_SZ);
+	int succ_posts = post_page_recv_requests_fast(mcast_qp_, 8192 - BATCH_SZ, BATCH_SZ);
 	curr_idx_ += succ_posts;
 	n_posted_recvs_ = curr_idx_;
 	std::cout << "Posted " << n_posted_recvs_ << " RRs for pages.\n";
@@ -1037,7 +1038,7 @@ int ServerRDMA::Poll(int timeout_s) {
 			}
 		}
 
-		if ((n_posted_recvs_ < 8192-32)) {
+		if ((n_posted_recvs_ < 6000)) {
 			// TODO(dimlek): What is a good number of recv requests to post here?
 			// We don't want to post a lot due to risk of increasing backpressure.
 			succ_posts = post_page_recv_requests_fast(mcast_qp_, 32, BATCH_SZ);
