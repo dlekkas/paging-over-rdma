@@ -222,7 +222,10 @@ struct server_info {
 struct mcswap_server_ctrl {
 	struct rdma_cm_id *id;
 	struct ib_qp *qp;
-	struct ib_cq *cq;
+	struct ib_pd *pd;
+
+	struct ib_cq *send_cq;
+	struct ib_cq *recv_cq;
 
 	struct mem_info mem;
 	struct sockaddr_in sin_addr;
@@ -896,31 +899,29 @@ static void swapmon_rdma_qp_event(struct ib_event *event, void *context) {
 // a Receive Queue (RQ) (used for receiving incoming messages), and their
 // associated Completion Queues (CQs). A "queue" is analogous to a FIFO waiting
 // line where items must leave the queue in the same order that they enter it.
-static int swapmon_rdma_create_qp(const int factor) {
+static int mcswap_rc_create_qp(struct mcswap_server_ctrl *server_ctrl) {
 	struct ib_qp_init_attr init_attr;
 	int ret;
 
 	memset(&init_attr, 0, sizeof(init_attr));
 	init_attr.event_handler = swapmon_rdma_qp_event;
-	/* +1 for drain */
-	init_attr.cap.max_send_wr = factor * ctrl->queue_size + 1;
-	/* +1 for drain */
-	init_attr.cap.max_recv_wr = 12 * 1024;
+	init_attr.cap.max_send_wr = 8096;
+	init_attr.cap.max_recv_wr = 8096;
 	init_attr.cap.max_recv_sge = 1;
 	init_attr.cap.max_send_sge = 1;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_RC;
-	init_attr.send_cq = ctrl->send_cq;
-	init_attr.recv_cq = ctrl->recv_cq;
+	init_attr.send_cq = server_ctrl->send_cq;
+	init_attr.recv_cq = server_ctrl->recv_cq;
 
 	// allocate a queue pair (QP) and associate it with the specified
 	// RDMA identifier cm_id
-	ret = rdma_create_qp(ctrl->cm_id, ctrl->pd, &init_attr);
+	ret = rdma_create_qp(server_ctrl->id, server_ctrl->pd, &init_attr);
 	if (ret) {
-		pr_err("rdma_create_qp failed.\n");
+		pr_err("rdma_create_qp failed: %d\n", ret);
+		return ret;
 	}
-	ctrl->qp = ctrl->cm_id->qp;
-
+	server_ctrl->qp = server_ctrl->id->qp;
 	return ret;
 }
 
@@ -1005,6 +1006,84 @@ out_err:
 	return ret;
 }
 
+static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
+	struct mcswap_server_ctrl *server_ctrl = cm_id->context;
+	int comp_vector = 0;
+	int ret;
+
+	// struct ib_device represents a handle to the HCA
+	if (!ctrl->dev) {
+		pr_err("no rdma device found.\n");
+		ret = -ENODEV;
+		goto out_err;
+	}
+
+	// Allocate a protection domain which we can use to create objects within
+	// the domain. we can register and associate memory regions with this PD
+	// In addition to the CQs to be associated with the QP about to be created,
+	// the PD that the QP will belong to must also have been created.
+	if (ctrl->pd) {
+		server_ctrl->pd = ctrl->pd;
+	} else {
+		pr_err("protection domain is invalid");
+		ret = -ENOENT;
+		goto out_err;
+	}
+
+	// check whether memory registrations are supported
+	if (!(ctrl->dev->attrs.device_cap_flags &
+				IB_DEVICE_MEM_MGT_EXTENSIONS)) {
+		pr_err("Memory registrations not supported.\n");
+		ret = -ENOTSUPP;
+		goto out_err;
+	}
+
+	// Before creating the local QP, we must first cause the HCA to create the CQs
+	// to be associated with the SQ and RQ of the QP about to be created. The QP's
+	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
+	// specifies the number of Completion Queue Entries (CQEs) and represents the
+	// size of the CQ.
+	server_ctrl->send_cq = ib_alloc_cq(ctrl->dev, server_ctrl, 8096,
+			comp_vector, IB_POLL_SOFTIRQ);
+	if (IS_ERR(server_ctrl->send_cq)) {
+		ret = PTR_ERR(server_ctrl->send_cq);
+		goto out_err;
+	}
+
+	server_ctrl->recv_cq = ib_alloc_cq(ctrl->dev, server_ctrl, 8096,
+			comp_vector, IB_POLL_SOFTIRQ);
+	if (IS_ERR(server_ctrl->recv_cq)) {
+		ret = PTR_ERR(server_ctrl->recv_cq);
+		goto out_destroy_send_cq;
+	}
+
+	ret = mcswap_rc_create_qp(server_ctrl);
+	if (ret) {
+		goto out_destroy_recv_cq;
+	}
+
+	// we now resolve the RDMA address bound to the RDMA identifier into
+	// route information needed to establish a connection. This is invoked
+	// in the client side of the connection and we must have already resolved
+	// the dest address into an RDMA address through `rdma_resolve_addr`.
+	ret = rdma_resolve_route(server_ctrl->id, SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+	if (ret) {
+		pr_err("rdma_resolve_route failed: %d\n", ret);
+		goto out_destroy_qp;
+	}
+	return 0;
+
+out_destroy_qp:
+	rdma_destroy_qp(server_ctrl->id);
+out_destroy_recv_cq:
+	ib_free_cq(server_ctrl->send_cq);
+out_destroy_send_cq:
+	ib_free_cq(server_ctrl->recv_cq);
+out_err:
+	return ret;
+}
+
+
 static int swapmon_rdma_route_resolved(void) {
 	// specify the connection parameters
 	struct rdma_conn_param param = {};
@@ -1086,7 +1165,7 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 
 	switch (event->event) {
 		case RDMA_CM_EVENT_ADDR_RESOLVED:
-			cm_error = swapmon_rdma_addr_resolved();
+			cm_error = mcswap_rdma_addr_resolved(id);
 			break;
 		case RDMA_CM_EVENT_ROUTE_RESOLVED:
 			cm_error = swapmon_rdma_route_resolved();
@@ -1357,7 +1436,7 @@ static void __exit mcswap_destroy_caches(void) {
 static int __init mcswap_server_connect(
 		struct mcswap_server_ctrl *server_ctrl, char *ip, int port) {
 	int ret;
-	pr_info("%s(%s, %d)\n", __func__, ip, port);
+	pr_info("%s(ip=%s, port=%d)\n", __func__, ip, port);
 	server_ctrl->id = rdma_create_id(&init_net, mcswap_cm_event_handler,
 			server_ctrl, RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(ctrl->cm_id)) {
@@ -1377,6 +1456,18 @@ static int __init mcswap_server_connect(
 		pr_err("failed to parse client ip addr %s (code = %d)\n", client_ip, ret);
 		goto destroy_cm_id;
 	}
+
+	// Resolve destination and optionally source addresses from IP addresses to an
+	// RDMA address and if the resolution is successful, then the RDMA cm id will
+	// be bound to an RDMA device.
+	ret = rdma_resolve_addr(server_ctrl->id, (struct sockaddr *)
+			&ctrl->client_addr, (struct sockaddr *) &server_ctrl->sin_addr,
+			SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+	if (ret) {
+		pr_err("rdma_resolve_addr failed: %d\n", ret);
+		goto destroy_cm_id;
+	}
+
 	return 0;
 
 destroy_cm_id:
