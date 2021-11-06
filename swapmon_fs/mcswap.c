@@ -40,14 +40,11 @@
 #include <linux/hashtable.h>
 #include <linux/rbtree.h>
 
-#define SWAPMON_RDMA_CONNECTION_TIMEOUT_MS 3000
+#define MCSWAP_RDMA_CONNECTION_TIMEOUT_MS 3000
 #define MCSWAP_MCAST_JOIN_TIMEOUT_MS 5000
-#define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
 #define MCSWAP_MAX_SEND_RETRIES 3
-
+#define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
 #define MCSWAP_MAX_MCAST_CQE 12288
-
-#define UC_QKEY 0x11111111
 
 #ifdef CONFIG_DEBUG_FS
 #include <linux/debugfs.h>
@@ -129,6 +126,7 @@ static struct mcswap_tree *mcswap_trees[MAX_SWAPFILES];
 struct rdma_req {
 	struct ib_cqe cqe;
 	struct completion done;
+	u64 dma;
 };
 
 struct page_ack_req {
@@ -219,7 +217,7 @@ struct server_info {
 	struct ud_transport_info ud_transport;
 };
 
-struct mcswap_server_ctrl {
+struct server_ctx {
 	struct rdma_cm_id *id;
 	struct ib_qp *qp;
 	struct ib_pd *pd;
@@ -242,18 +240,12 @@ struct swapmon_rdma_ctrl {
 	struct ib_pd *mcast_pd;
 
 
-	// queue pair (QP)
-	struct ib_qp *qp;
-	struct ib_qp *ud_qp;
 	struct ib_qp *mcast_qp;
 
-	// completion queue (CQ)
-	struct ib_cq *send_cq;
-	struct ib_cq *recv_cq;
 	struct ib_cq *mcast_cq;
 
 	//struct server_info server;
-	struct mcswap_server_ctrl *server;
+	struct server_ctx *server;
 
 	struct ib_ah *ah;
 
@@ -278,17 +270,13 @@ struct swapmon_rdma_ctrl {
 
 	struct completion mcast_ack;
 
-	int queue_size;
-
-	// RDMA connection state
-	enum rdma_cm_event_type state;
-
 	// IPv4 addresses
-	struct sockaddr_in server_addr;
 	struct sockaddr_in client_addr;
 
 	// Infiniband address
 	struct sockaddr_ib mcast_addr;
+
+	int n_servers;
 };
 
 struct swapmon_transport_ops {
@@ -424,7 +412,8 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 		ent = rb_find_page_remote_info(&tree->root, offset);
 		spin_unlock_bh(&tree->lock);
 		pr_info("[%u] page %lu stored at: remote addr = %llu, rkey = %u\n",
-				page_cnt, offset, ent->info.remote_addr, ent->info.rkey);
+				atomic_read(mcswap_stored_pages), offset, ent->info.remote_addr,
+				ent->info.rkey);
   }
 #else
 	spin_unlock_bh(&tree->lock);
@@ -432,43 +421,50 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 	kmem_cache_free(page_ack_req_cache, req);
 }
 
-static int post_recv_page_ack_msg(struct page_ack_req *req) {
-	struct ib_recv_wr wr, *bad_wr;
-	struct mcswap_entry *entry;
+
+static int mcswap_post_recv_page_ack(struct page_ack_req *req) {
+	struct ib_recv_wr *bad_wr;
+	struct ib_recv_wr wr;
 	struct ib_sge sge;
+	struct mcswap_entry *ent;
 	u64 dma_addr;
-	int ret;
+	int i, ret;
 
-	entry = req->entry;
-	dma_addr = ib_dma_map_single(ctrl->dev, &entry->info,
-			sizeof(entry->info), DMA_FROM_DEVICE);
-	if (unlikely(ib_dma_mapping_error(ctrl->dev, dma_addr))) {
-		pr_err("dma address mapping error.\n");
-		return -1;
-	}
+	for (i = 0; i < ctrl->n_servers; i++) {
+		ent = req[i].entry;
+		dma_addr = ib_dma_map_single(ctrl->dev, &ent->info,
+				sizeof(ent->info), DMA_FROM_DEVICE);
+		ret = ib_dma_mapping_error(ctrl->dev, dma_addr);
+		if (unlikely(ret)) {
+			pr_err("dma address mapping error: %d\n", ret);
+			return ret;
+		}
 
-	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
-			sizeof(entry->info), DMA_FROM_DEVICE);
+		ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+				sizeof(ent->info), DMA_FROM_DEVICE);
 
-	sge.addr = dma_addr;
-	sge.length = sizeof(entry->info);
-	sge.lkey = ctrl->pd->local_dma_lkey;
+		sge.addr = dma_addr;
+		sge.length = sizeof(ent->info);
+		sge.lkey = ctrl->pd->local_dma_lkey;
 
-	wr.wr_cqe = &req->cqe;
-	wr.next = NULL;
-	wr.sg_list = &sge;
-	wr.num_sge = 1;
+		wr.wr_cqe = &req[i].cqe;
+		wr.next = NULL;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
 
-	ret = ib_post_recv(ctrl->qp, &wr, &bad_wr);
-	if (ret) {
-		pr_err("ib_post_recv failed to post RR for page ack (code = %d).\n", ret);
-		return ret;
+		ret = ib_post_recv(ctrl->server[i].qp, &wr, &bad_wr);
+		if (ret) {
+			pr_err("ib_post_recv failed to post RR"
+					"for page ack (code = %d)\n", ret);
+			return ret;
+		}
 	}
 
 	return 0;
 }
 
 
+/*
 static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	struct mcswap_tree *tree = mcswap_trees[swap_type];
@@ -545,6 +541,7 @@ free_page_req:
 	kmem_cache_free(page_ack_req_cache, req);
 	return ret;
 }
+*/
 
 static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 		struct page *page) {
@@ -565,7 +562,7 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 #ifdef BENCH
 	getnstimeofday(&ts_start);
 #endif
-	ret = swapmon_store_sync(swap_type, offset, page);
+	//ret = swapmon_store_sync(swap_type, offset, page);
 	if (ret) {
 		pr_err("failed to store page with offset = %lu\n", offset);
 		return ret;
@@ -595,36 +592,43 @@ static int __mcswap_store_sync(unsigned swap_type, pgoff_t offset,
 static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 												 struct page *page) {
 	struct mcswap_entry* rmem_node;
+	struct mcswap_entry* ent;
 	struct page_ack_req* req;
-	int ret;
-	rmem_node = kmem_cache_alloc(mcswap_entry_cache, GFP_KERNEL);
-	if (unlikely(!rmem_node)) {
-		pr_err("kzalloc failed to allocate mem for u64.\n");
-		return -ENOMEM;
-	}
-	rmem_node->offset = offset;
+	int i, ret;
 
-	req = kmem_cache_alloc(page_ack_req_cache, GFP_KERNEL);
-	if (unlikely(!req)) {
-		pr_err("slab allocator failed to allocate mem for page_ack_req.\n");
+	ret = kmem_cache_alloc_bulk(mcswap_entry_cache, GFP_KERNEL,
+			ctrl->n_servers, (void *) &ent);
+	if (unlikely(ret)) {
+		pr_err("kmem_cache_alloc_bulk failed: %d\n", ret);
 		return -ENOMEM;
 	}
-	req->entry = rmem_node;
-	req->cqe.done = page_ack_done;
-	req->swap_type = swap_type;
+
+	ret = kmem_cache_alloc_bulk(page_ack_req_cache, GFP_KERNEL,
+			ctrl->n_servers, (void *) &req);
+	if (unlikely(ret)) {
+		pr_err("kmem_cache_alloc_bulk failed: %d\n", ret);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < ctrl->n_servers; i++) {
+		ent[i].offset = offset;
+		req[i].entry = rmem_node;
+		req[i].cqe.done = page_ack_done;
+		req[i].swap_type = swap_type;
+	}
 
 	// post RR for the ACK message to be received from mem server
-	ret = post_recv_page_ack_msg(req);
+	ret = mcswap_post_recv_page_ack(req);
 	if (ret) {
-		pr_err("post_recv_page_ack_msg failed.\n");
-		return -1;
+		pr_err("mcswap_post_recv_page_ack failed\n");
+		return ret;
 	}
 
 	// multicast the physical page to the memory servers
 	ret = swapmon_mcast_send(page, offset);
 	if (unlikely(ret)) {
 		pr_err("swapmon_mcast_send() failed.\n");
-		return -1;
+		return ret;
 	}
 	/*
 	pr_info("[%u] %s(swap_type = %u, offset = %lu)\n",
@@ -636,11 +640,6 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 	return 0;
 }
 
-struct hack_s {
-	struct ib_cqe cqe;
-	struct completion req_done;
-};
-
 static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 	struct rdma_req *req = container_of(wc->wr_cqe, struct rdma_req, cqe);
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
@@ -649,6 +648,8 @@ static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 		return;
 	}
 	complete(&req->done);
+
+	ib_dma_unmap_page(ctrl->dev, req->dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
 }
 
 static int swapmon_rdma_read_sync(struct page *page,
@@ -681,6 +682,7 @@ static int swapmon_rdma_read_sync(struct page *page,
 		return -ENOMEM;
 	}
 	req->cqe.done = page_read_done;
+	req->dma = dma_addr;
 	init_completion(&req->done);
 
 	rdma_wr.wr.wr_cqe = &req->cqe;
@@ -693,8 +695,9 @@ static int swapmon_rdma_read_sync(struct page *page,
 	rdma_wr.remote_addr = ent->info.remote_addr;
 	rdma_wr.rkey = ent->info.rkey;
 
-	ret = ib_post_send(ctrl->qp, &rdma_wr.wr, &bad_send_wr);
-	if (ret) {
+	// TODO(dimlek): fix it below
+	ret = ib_post_send(ctrl->server[0].qp, &rdma_wr.wr, &bad_send_wr);
+	if (unlikely(ret)) {
 		pr_err("ib_post_send failed to read remote page.\n");
 		return ret;
 	}
@@ -706,7 +709,7 @@ static int swapmon_rdma_read_sync(struct page *page,
 		return wait_ret;
 	} else if (unlikely(wait_ret == 0)) {
 		pr_err("timed out on ack waiting.\n");
-		return -1;
+		return -ETIME;
 	}
 
 	return 0;
@@ -899,7 +902,7 @@ static void swapmon_rdma_qp_event(struct ib_event *event, void *context) {
 // a Receive Queue (RQ) (used for receiving incoming messages), and their
 // associated Completion Queues (CQs). A "queue" is analogous to a FIFO waiting
 // line where items must leave the queue in the same order that they enter it.
-static int mcswap_rc_create_qp(struct mcswap_server_ctrl *server_ctrl) {
+static int mcswap_rc_create_qp(struct server_ctx *ctx) {
 	struct ib_qp_init_attr init_attr;
 	int ret;
 
@@ -911,103 +914,22 @@ static int mcswap_rc_create_qp(struct mcswap_server_ctrl *server_ctrl) {
 	init_attr.cap.max_send_sge = 1;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_RC;
-	init_attr.send_cq = server_ctrl->send_cq;
-	init_attr.recv_cq = server_ctrl->recv_cq;
+	init_attr.send_cq = ctx->send_cq;
+	init_attr.recv_cq = ctx->recv_cq;
 
 	// allocate a queue pair (QP) and associate it with the specified
 	// RDMA identifier cm_id
-	ret = rdma_create_qp(server_ctrl->id, server_ctrl->pd, &init_attr);
+	ret = rdma_create_qp(ctx->id, ctx->pd, &init_attr);
 	if (ret) {
 		pr_err("rdma_create_qp failed: %d\n", ret);
 		return ret;
 	}
-	server_ctrl->qp = server_ctrl->id->qp;
-	return ret;
-}
-
-
-static int swapmon_rdma_addr_resolved(void) {
-	const int send_wr_factor = 11;
-	const int cq_factor = send_wr_factor + 1;
-	int comp_vector = 0;
-	int ret;
-
-	// struct ib_device represents a handle to the HCA
-	ctrl->dev = ctrl->cm_id->device;
-	if (!ctrl->dev) {
-		pr_err("No device found.\n");
-		ret = PTR_ERR(ctrl->dev);
-		goto out_err;
-	}
-
-	// Allocate a protection domain which we can use to create objects within
-	// the domain. we can register and associate memory regions with this PD
-	// In addition to the CQs to be associated with the QP about to be created,
-	// the PD that the QP will belong to must also have been created.
-	ctrl->pd = ib_alloc_pd(ctrl->dev, 0);
-	if (IS_ERR(ctrl->pd)) {
-		pr_err("ib_alloc_pd failed.\n");
-		ret = PTR_ERR(ctrl->pd);
-		goto out_err;
-	}
-
-	// check whether memory registrations are supported
-	if (!(ctrl->dev->attrs.device_cap_flags &
-				IB_DEVICE_MEM_MGT_EXTENSIONS)) {
-		pr_err("Memory registrations not supported.\n");
-		ret = -1;
-		goto out_free_pd;
-	}
-
-	// Before creating the local QP, we must first cause the HCA to create the CQs
-	// to be associated with the SQ and RQ of the QP about to be created. The QP's
-	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
-	// specifies the number of Completion Queue Entries (CQEs) and represents the
-	// size of the CQ.
-	ctrl->send_cq = ib_alloc_cq(ctrl->dev, ctrl, cq_factor * 1024,
-			comp_vector, IB_POLL_SOFTIRQ);
-	if (IS_ERR(ctrl->send_cq)) {
-		ret = PTR_ERR(ctrl->send_cq);
-		goto out_err;
-	}
-
-	ctrl->recv_cq = ib_alloc_cq(ctrl->dev, ctrl, cq_factor * 1024,
-			comp_vector, IB_POLL_SOFTIRQ);
-	if (IS_ERR(ctrl->recv_cq)) {
-		ret = PTR_ERR(ctrl->recv_cq);
-		goto out_err;
-	}
-
-	ret = swapmon_rdma_create_qp(1024);
-	if (ret) {
-		pr_err("swapmon_rdma_create_qp failed\n");
-		goto out_destroy_ib_cq;
-	}
-
-	// we now resolve the RDMA address bound to the RDMA identifier into
-	// route information needed to establish a connection. This is invoked
-	// in the client side of the connection and we must have already resolved
-	// the dest address into an RDMA address through `rdma_resolve_addr`.
-	ret = rdma_resolve_route(ctrl->cm_id, SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
-	if (ret) {
-		pr_err("rdma_resolve_route failed: %d\n", ret);
-		goto out_destroy_qp;
-	}
-
-	return 0;
-
-out_destroy_qp:
-	rdma_destroy_qp(ctrl->cm_id);
-out_destroy_ib_cq:
-	ib_free_cq(ctrl->send_cq);
-out_free_pd:
-	ib_dealloc_pd(ctrl->pd);
-out_err:
+	ctx->qp = ctx->id->qp;
 	return ret;
 }
 
 static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
-	struct mcswap_server_ctrl *server_ctrl = cm_id->context;
+	struct server_ctx *ctx = cm_id->context;
 	int comp_vector = 0;
 	int ret;
 
@@ -1023,7 +945,7 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 	// In addition to the CQs to be associated with the QP about to be created,
 	// the PD that the QP will belong to must also have been created.
 	if (ctrl->pd) {
-		server_ctrl->pd = ctrl->pd;
+		ctx->pd = ctrl->pd;
 	} else {
 		pr_err("protection domain is invalid");
 		ret = -ENOENT;
@@ -1043,21 +965,21 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
 	// specifies the number of Completion Queue Entries (CQEs) and represents the
 	// size of the CQ.
-	server_ctrl->send_cq = ib_alloc_cq(ctrl->dev, server_ctrl, 8096,
+	ctx->send_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
 			comp_vector, IB_POLL_SOFTIRQ);
-	if (IS_ERR(server_ctrl->send_cq)) {
-		ret = PTR_ERR(server_ctrl->send_cq);
+	if (IS_ERR(ctx->send_cq)) {
+		ret = PTR_ERR(ctx->send_cq);
 		goto out_err;
 	}
 
-	server_ctrl->recv_cq = ib_alloc_cq(ctrl->dev, server_ctrl, 8096,
+	ctx->recv_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
 			comp_vector, IB_POLL_SOFTIRQ);
-	if (IS_ERR(server_ctrl->recv_cq)) {
-		ret = PTR_ERR(server_ctrl->recv_cq);
+	if (IS_ERR(ctx->recv_cq)) {
+		ret = PTR_ERR(ctx->recv_cq);
 		goto out_destroy_send_cq;
 	}
 
-	ret = mcswap_rc_create_qp(server_ctrl);
+	ret = mcswap_rc_create_qp(ctx);
 	if (ret) {
 		goto out_destroy_recv_cq;
 	}
@@ -1066,7 +988,8 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 	// route information needed to establish a connection. This is invoked
 	// in the client side of the connection and we must have already resolved
 	// the dest address into an RDMA address through `rdma_resolve_addr`.
-	ret = rdma_resolve_route(server_ctrl->id, SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+	ret = rdma_resolve_route(ctx->id,
+			MCSWAP_RDMA_CONNECTION_TIMEOUT_MS);
 	if (ret) {
 		pr_err("rdma_resolve_route failed: %d\n", ret);
 		goto out_destroy_qp;
@@ -1074,18 +997,17 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 	return 0;
 
 out_destroy_qp:
-	rdma_destroy_qp(server_ctrl->id);
+	rdma_destroy_qp(ctx->id);
 out_destroy_recv_cq:
-	ib_free_cq(server_ctrl->send_cq);
+	ib_free_cq(ctx->send_cq);
 out_destroy_send_cq:
-	ib_free_cq(server_ctrl->recv_cq);
+	ib_free_cq(ctx->recv_cq);
 out_err:
 	return ret;
 }
 
 
-static int swapmon_rdma_route_resolved(void) {
-	// specify the connection parameters
+static int mcswap_rdma_route_resolved(struct server_ctx *ctx) {
 	struct rdma_conn_param param = {};
   int ret;
 
@@ -1094,9 +1016,9 @@ static int swapmon_rdma_route_resolved(void) {
   param.responder_resources = 8;
   param.initiator_depth = 8;
   param.flow_control = 0;
-  param.retry_count = 3;
-  param.rnr_retry_count = 3;
-  param.qp_num = ctrl->qp->qp_num;
+  param.retry_count = MCSWAP_MAX_SEND_RETRIES;
+  param.rnr_retry_count = MCSWAP_MAX_SEND_RETRIES;
+  param.qp_num = ctx->qp->qp_num;
 
   pr_info("max_qp_rd_atom=%d max_qp_init_rd_atom=%d\n",
       ctrl->dev->attrs.max_qp_rd_atom,
@@ -1104,10 +1026,12 @@ static int swapmon_rdma_route_resolved(void) {
 
 	// Initiate an active connection request (i.e. send REQ message). The route
 	// must have been resolved before trying to connect.
-  ret = rdma_connect(ctrl->cm_id, &param);
+  ret = rdma_connect(ctx->id, &param);
   if (ret) {
-    pr_err("rdma_connect failed (%d)\n", ret);
-    ib_free_cq(ctrl->send_cq);
+    pr_err("rdma_connect failed: %d\n", ret);
+    ib_free_cq(ctx->send_cq);
+    ib_free_cq(ctx->recv_cq);
+		return ret;
   }
 	pr_info("trying to rdma_connect() ...\n");
 
@@ -1146,7 +1070,6 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event) {
 
 	ctrl->remote_mcast_qpn = param->qp_num;
 	ctrl->remote_mcast_qkey = param->qkey;
-
 	ctrl->mcast_ah = rdma_create_ah(ctrl->pd, &param->ah_attr);
 	if (!ctrl->mcast_ah) {
 		pr_err("failed to create address handle for multicast\n");
@@ -1155,9 +1078,77 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event) {
 	return 0;
 }
 
+static int recv_mem_info(struct ib_qp *qp) {
+	struct ib_recv_wr *bad_wr;
+	struct ib_recv_wr wr;
+	struct ib_sge sge;
+	struct ib_wc wc;
+	u64 dma_addr;
+	int ret;
+
+	struct server_info {
+		u64 addr;
+		u32 len;
+		u32 key;
+		u32 qpn;
+	};
+
+	struct server_info *msg;
+	msg = kzalloc(sizeof(struct server_info), GFP_KERNEL);
+	if (!msg) {
+		pr_err("kzalloc failed to allocate mem for struct server_info.\n");
+		return -ENOMEM;
+	}
+
+	// Map kernel virtual address `ctrl->rmem` to a DMA address.
+	dma_addr = ib_dma_map_single(ctrl->dev, msg,
+			sizeof(struct server_info), DMA_FROM_DEVICE);
+	if (ib_dma_mapping_error(ctrl->dev, dma_addr)) {
+		pr_err("dma address mapping error.\n");
+	}
+
+	// Prepare DMA region to be accessed by device.
+	ib_dma_sync_single_for_device(ctrl->dev, dma_addr,
+			sizeof(struct server_info), DMA_FROM_DEVICE);
+
+	sge.addr = dma_addr;
+	sge.length = sizeof(struct server_info);
+	sge.lkey = ctrl->pd->local_dma_lkey;
+
+	wr.next = NULL;
+	wr.wr_id = 0;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+
+	ret = ib_post_recv(qp, &wr, &bad_wr);
+	if (ret) {
+		pr_err("ib_post_recv failed to receive remote mem info.\n");
+		return ret;
+	}
+
+	while (!ib_poll_cq(qp->recv_cq, 1, &wc)) {
+		// nothing
+	}
+
+	if (wc.status != IB_WC_SUCCESS) {
+		printk("Polling failed with status %s (work request ID = %llu).\n",
+					 ib_wc_status_msg(wc.status), wc.wr_id);
+		return wc.status;
+	}
+
+	/*
+	ctrl->server.mem.addr = msg->addr;
+	ctrl->server.mem.len  = msg->len;
+	ctrl->server.mem.key  = msg->key;
+	*/
+	pr_info("Remote mem info: addr = %llu, len = %u, key = %u\n",
+			msg->addr, msg->len, msg->key);
+
+	return 0;
+}
+
 static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event) {
-	struct ib_port_attr port_attr;
 	int cm_error = 0;
 	int ret;
 	printk("%s msg: %s (%d) status %d id $%p\n", __func__,
@@ -1168,24 +1159,13 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 			cm_error = mcswap_rdma_addr_resolved(id);
 			break;
 		case RDMA_CM_EVENT_ROUTE_RESOLVED:
-			cm_error = swapmon_rdma_route_resolved();
+			cm_error = mcswap_rdma_route_resolved(id->context);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
-			ret = ib_query_port(ctrl->dev, ctrl->cm_id->port_num, &port_attr);
-			if (ret) {
-				pr_err("ib_query_port failed to query port_num = %u\n",
-						ctrl->cm_id->port_num);
-			}
-			if (port_attr.active_mtu != IB_MTU_4096) {
-				pr_err("port_num = %u needs active MTU = %u (current MTU = %u)",
-						ctrl->cm_id->port_num, ib_mtu_enum_to_int(IB_MTU_4096),
-						ib_mtu_enum_to_int(port_attr.active_mtu));
-			}
-
 			pr_info("connection established successfully\n");
 			// Wait to receive memory info to retrieve all required info to properly
 			// reference remote memory.
-			// ret = recv_mem_info(id->qp);
+			ret = recv_mem_info(id->qp);
 			if (ret) {
 				pr_err("unable to receive remote mem info.\n");
 			}
@@ -1212,7 +1192,7 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
 			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
-			pr_info("multicast join operation completed successfully.\n");
+			pr_info("multicast join operation completed successfully\n");
 			// post_recv_control_msg(1);
 			cm_error = mcswap_mcast_join_handler(event);
 			ctrl->cm_error = cm_error;
@@ -1228,14 +1208,11 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 			break;
 	}
 
-	pr_info("cm_error=%d\n", cm_error);
-
-	/*
 	if (cm_error) {
+		pr_info("cm_error=%d\n", cm_error);
 		ctrl->cm_error = cm_error;
-		complete(&ctrl->cm_done);
+		// complete(&ctrl->cm_done);
 	}
-	*/
 
 	return 0;
 }
@@ -1295,6 +1272,40 @@ static int __init mcswap_rdma_bind_addr(struct rdma_cm_id *id,
 }
 
 
+static int mcswap_check_hca_support(struct ib_device *dev, u8 port_num) {
+	struct ib_port_attr port_attr;
+	int ret;
+
+	ret = ib_query_port(dev, port_num, &port_attr);
+	if (ret) {
+		pr_err("ib_query_port failed (%d) to query port_num = %u\n",
+				ret, port_num);
+		return -ENODEV;
+	}
+
+	// ensure that memory registrations are supported
+	if (!(dev->attrs.device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS)) {
+		pr_err("memory registrations not supported on port = %u\n", port_num);
+		return -EOPNOTSUPP;
+	}
+
+	// ensure that multicast is supported by the specified port of HCA
+	if (!rdma_cap_ib_mcast(dev, port_num)) {
+		pr_err("port %u of IB device doesn't support multicast\n", port_num);
+		return -EOPNOTSUPP;
+	}
+
+	// ensure that the port we are using has an active MTU of 4096KB
+	if (port_attr.active_mtu != IB_MTU_4096) {
+		pr_err("port_num = %u needs active MTU = %u (current MTU = %u)\n",
+				port_num, ib_mtu_enum_to_int(IB_MTU_4096),
+				ib_mtu_enum_to_int(port_attr.active_mtu));
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
 static int __init mcswap_rdma_mcast_init(void) {
 	int ret;
 
@@ -1315,10 +1326,8 @@ static int __init mcswap_rdma_mcast_init(void) {
 	// the `rdma_bind_addr` call then the RDMA identifier will be bound
 	// to the local RDMA device, so we can get a handle to the HCA
 	ctrl->dev = ctrl->mcast_cm_id->device;
-	if (!rdma_cap_ib_mcast(ctrl->dev, ctrl->mcast_cm_id->port_num)) {
-		pr_err("port %u of IB device doesn't support multicast\n",
-				ctrl->mcast_cm_id->port_num);
-		ret = -EOPNOTSUPP;
+	ret = mcswap_check_hca_support(ctrl->dev, ctrl->mcast_cm_id->port_num);
+	if (ret) {
 		goto destroy_mcast_cm_id;
 	}
 
@@ -1394,7 +1403,7 @@ static int __init mcswap_alloc_ctrl_resources(void) {
 	mcswap_entry_cache = KMEM_CACHE(mcswap_entry, 0);
 	if (unlikely(!mcswap_entry_cache)) {
 		pr_err("failed to create slab cache for mcswap entries\n");
-		goto free_server_ctrl;
+		goto free_ctx;
 	}
 
 	page_ack_req_cache = KMEM_CACHE(page_ack_req, 0);
@@ -1410,7 +1419,7 @@ static int __init mcswap_alloc_ctrl_resources(void) {
 	}
 	return 0;
 
-free_server_ctrl:
+free_ctx:
 	kfree(ctrl->server);
 free_ctrl:
 	kfree(ctrl);
@@ -1434,22 +1443,22 @@ static void __exit mcswap_destroy_caches(void) {
 
 
 static int __init mcswap_server_connect(
-		struct mcswap_server_ctrl *server_ctrl, char *ip, int port) {
+		struct server_ctx *ctx, char *ip, int port) {
 	int ret;
 	pr_info("%s(ip=%s, port=%d)\n", __func__, ip, port);
-	server_ctrl->id = rdma_create_id(&init_net, mcswap_cm_event_handler,
-			server_ctrl, RDMA_PS_TCP, IB_QPT_RC);
-	if (IS_ERR(ctrl->cm_id)) {
-		pr_err("failed to create CM ID: %ld\n", PTR_ERR(ctrl->cm_id));
+	ctx->id = rdma_create_id(&init_net, mcswap_cm_event_handler,
+			ctx, RDMA_PS_TCP, IB_QPT_RC);
+	if (IS_ERR(ctx->id)) {
+		pr_err("failed to create CM ID: %ld\n", PTR_ERR(ctx->id));
 		return -ENODEV;
 	}
 
-	ret = swapmon_rdma_parse_ipaddr(&server_ctrl->sin_addr, ip);
+	ret = swapmon_rdma_parse_ipaddr(&ctx->sin_addr, ip);
 	if (ret) {
 		pr_err("failed to parse server ip addr %s (code = %d)\n", ip, ret);
 		goto destroy_cm_id;
 	}
-	server_ctrl->sin_addr.sin_port = port;
+	ctx->sin_addr.sin_port = cpu_to_be16(port);
 
 	ret = swapmon_rdma_parse_ipaddr(&ctrl->client_addr, client_ip);
 	if (ret) {
@@ -1460,32 +1469,32 @@ static int __init mcswap_server_connect(
 	// Resolve destination and optionally source addresses from IP addresses to an
 	// RDMA address and if the resolution is successful, then the RDMA cm id will
 	// be bound to an RDMA device.
-	ret = rdma_resolve_addr(server_ctrl->id, (struct sockaddr *)
-			&ctrl->client_addr, (struct sockaddr *) &server_ctrl->sin_addr,
-			SWAPMON_RDMA_CONNECTION_TIMEOUT_MS);
+	ret = rdma_resolve_addr(ctx->id, (struct sockaddr *)
+			&ctrl->client_addr, (struct sockaddr *) &ctx->sin_addr,
+			MCSWAP_RDMA_CONNECTION_TIMEOUT_MS);
 	if (ret) {
 		pr_err("rdma_resolve_addr failed: %d\n", ret);
 		goto destroy_cm_id;
 	}
-
 	return 0;
 
 destroy_cm_id:
-	rdma_destroy_id(server_ctrl->id);
+	rdma_destroy_id(ctx->id);
 	return ret;
 }
 
 static int __init mcswap_init(void) {
 	int ret, i;
-	if (nr_servers > MAX_NR_SERVERS) {
-		pr_warn("max supported memory servers: %d\n", MAX_NR_SERVERS);
-		nr_servers = MAX_NR_SERVERS;
-	}
-
 	ret = mcswap_alloc_ctrl_resources();
 	if (ret) {
 		return ret;
 	}
+
+	if (nr_servers > MAX_NR_SERVERS) {
+		pr_warn("max supported memory servers: %d\n", MAX_NR_SERVERS);
+		nr_servers = MAX_NR_SERVERS;
+	}
+	ctrl->n_servers = nr_servers;
 
 	ret = mcswap_rdma_mcast_init();
 	if (ret) {
@@ -1493,11 +1502,11 @@ static int __init mcswap_init(void) {
 		goto destroy_caches;
 	}
 
-	for (i = 0; i < nr_servers; i++) {
-		ret = mcswap_server_connect(&ctrl->server[i], server_ip[i], server_port);
-		if (ret) {
+	for (i = 0; i < ctrl->n_servers; i++) {
+		ret = mcswap_server_connect(&ctrl->server[i],
+				server_ip[i], server_port);
+		if (ret)
 			goto destroy_mcast_resources;
-		}
 		pr_info("connected successfully to server %s\n", server_ip[i]);
 	}
 
