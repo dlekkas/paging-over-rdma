@@ -216,21 +216,19 @@ struct server_ctx {
 	int cm_error;
 };
 
-struct ud_mcast_info {
+struct mcswap_route_info {
 	u8 gid_raw[16];
 	u16 lid;
 	u32 qkey;
 };
 
 struct mcast_ctx {
+	struct mcswap_route_info *ri;
+
 	struct rdma_cm_id *cm_id;
 	struct ib_qp *qp;
 	struct ib_cq *cq;
 	struct ib_ah *ah;
-
-	// routing info
-	u8  gid_raw[16];
-	u16 lid;
 
 	u32 qpn;
 	u32 qkey;
@@ -240,8 +238,8 @@ struct swapmon_rdma_ctrl {
 	struct ib_device *dev;
 	struct ib_pd *pd;
 
-	struct server_ctx *server;
 	struct mcast_ctx mcast;
+	struct server_ctx *server;
 
 	struct completion mcast_done;
 
@@ -254,10 +252,6 @@ struct swapmon_rdma_ctrl {
 	struct sockaddr_ib mcast_addr;
 
 	int n_servers;
-};
-
-struct swapmon_transport_ops {
-	struct swapmon_rdma_ctrl *(*create_ctrl)(struct device *dev);
 };
 
 struct swapmon_rdma_ctrl* ctrl;
@@ -929,14 +923,6 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 		goto out_err;
 	}
 
-	// check whether memory registrations are supported
-	if (!(ctrl->dev->attrs.device_cap_flags &
-				IB_DEVICE_MEM_MGT_EXTENSIONS)) {
-		pr_err("Memory registrations not supported.\n");
-		ret = -ENOTSUPP;
-		goto out_err;
-	}
-
 	// Before creating the local QP, we must first cause the HCA to create the CQs
 	// to be associated with the SQ and RQ of the QP about to be created. The QP's
 	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
@@ -985,21 +971,18 @@ out_err:
 
 
 static int mcswap_rdma_route_resolved(struct server_ctx *ctx) {
+	struct mcast_ctx *mctx = &ctrl->mcast;
 	struct rdma_conn_param param = {};
   int ret;
 
-  param.private_data = NULL;
-  param.private_data_len = 0;
+  param.private_data = (void *) mctx->ri;
+  param.private_data_len = sizeof *mctx->ri;
   param.responder_resources = 8;
   param.initiator_depth = 8;
   param.flow_control = 0;
   param.retry_count = MCSWAP_MAX_SEND_RETRIES;
   param.rnr_retry_count = MCSWAP_MAX_SEND_RETRIES;
   param.qp_num = ctx->qp->qp_num;
-
-  pr_info("max_qp_rd_atom=%d max_qp_init_rd_atom=%d\n",
-      ctrl->dev->attrs.max_qp_rd_atom,
-      ctrl->dev->attrs.max_qp_init_rd_atom);
 
 	// Initiate an active connection request (i.e. send REQ message). The route
 	// must have been resolved before trying to connect.
@@ -1010,8 +993,6 @@ static int mcswap_rdma_route_resolved(struct server_ctx *ctx) {
     ib_free_cq(ctx->recv_cq);
 		return ret;
   }
-	pr_info("trying to rdma_connect() ...\n");
-
   return 0;
 }
 
@@ -1035,6 +1016,8 @@ static int str_to_ib_sockaddr(char *dst, struct sockaddr_ib *mcast_addr) {
 static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 		struct mcast_ctx *mc_ctx) {
 	struct rdma_ud_param *param = &event->param.ud;
+	const struct ib_global_route *grh = rdma_ah_read_grh(&param->ah_attr);
+
 	if (param->ah_attr.type != RDMA_AH_ATTR_TYPE_IB) {
 		pr_err("only IB address handle type is supported\n");
 		return -ENOTSUPP;
@@ -1046,6 +1029,16 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 			rdma_ah_get_sl(&param->ah_attr), rdma_ah_get_path_bits(&param->ah_attr),
 			param->qp_num, param->qkey);
 
+	mc_ctx->ri = kzalloc(sizeof *mc_ctx->ri , GFP_KERNEL);
+	if (!mc_ctx->ri) {
+		pr_err("failed to alloc memory for route info\n");
+		return -ENOMEM;
+	}
+
+	memcpy(mc_ctx->ri->gid_raw, grh->dgid.raw, sizeof grh->dgid);
+	mc_ctx->ri->lid  = rdma_ah_get_dlid(&param->ah_attr);
+	mc_ctx->ri->qkey = param->qkey;
+
 	mc_ctx->qpn  = param->qp_num;
 	mc_ctx->qkey = param->qkey;
 	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr);
@@ -1053,6 +1046,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 		pr_err("failed to create address handle for multicast\n");
 		return -ENOENT;
 	}
+
 	return 0;
 }
 
@@ -1205,16 +1199,13 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 static void recv_control_msg_done(struct ib_cq* cq, struct ib_wc* wc) {
 	struct server_ctx *ctx;
 	enum comm_ctrl_opcode op;
-
-	pr_info("%s()\n", __func__);
 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
 		pr_err("control message WC failed with status: %s\n",
 				ib_wc_status_msg(wc->status));
 		return;
 	}
-
-	if (!(wc->wc_flags & IB_WC_WITH_IMM)) {
-		pr_err("control message should always contain IMM data.\n");
+	if (unlikely(!(wc->wc_flags & IB_WC_WITH_IMM))) {
+		pr_err("control message doesn't contain IMM data\n");
 		return;
 	}
 
@@ -1222,14 +1213,15 @@ static void recv_control_msg_done(struct ib_cq* cq, struct ib_wc* wc) {
 	op = ntohl(wc->ex.imm_data);
 	switch(op) {
 		case MCAST_MEMBERSHIP_ACK:
-			pr_info("Mem server joined multicast group.\n");
+			pr_info("mem server joined multicast group.\n");
 			complete(&ctx->mcast_ack);
 			break;
 		case MCAST_MEMBERSHIP_NACK:
 			pr_info("Mem server failed to join multicast group.\n");
 			break;
 		default:
-			pr_err("Unrecognized control message with code: %u\n", op);
+			pr_err("(%s) unrecognized control message with op: %u\n",
+					__func__, op);
 			break;
 	}
 }
@@ -1359,7 +1351,7 @@ static int __init mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
 	int ret;
 
 	mctx->cm_id = rdma_create_id(&init_net, mcswap_cm_event_handler,
-			ctrl, RDMA_PS_UDP, IB_QPT_UD);
+			mctx, RDMA_PS_UDP, IB_QPT_UD);
 	if (IS_ERR(mctx->cm_id)) {
 		pr_err("multicast cm id creation failed\n");
 		return -ENODEV;
@@ -1405,7 +1397,7 @@ static int __init mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
 	init_completion(&ctrl->mcast_done);
 	str_to_ib_sockaddr("::", &ctrl->mcast_addr);
 	ret = rdma_join_multicast(mctx->cm_id, (struct sockaddr *)
-			&ctrl->mcast_addr, BIT(FULLMEMBER_JOIN), ctrl);
+			&ctrl->mcast_addr, BIT(FULLMEMBER_JOIN), mctx);
 	if (ret) {
 		pr_err("rdma_join_multicast failed: %d\n", ret);
 		goto destroy_mcast_qp;
@@ -1559,9 +1551,7 @@ static int __init mcswap_init(void) {
 		pr_warn("max supported memory servers: %d\n", MAX_NR_SERVERS);
 		nr_servers = MAX_NR_SERVERS;
 	}
-	pr_info("%d", ctrl->n_servers);
 	ctrl->n_servers = nr_servers;
-	pr_info("%d", ctrl->n_servers);
 
 	ret = mcswap_rdma_mcast_init(&ctrl->mcast);
 	if (ret) {

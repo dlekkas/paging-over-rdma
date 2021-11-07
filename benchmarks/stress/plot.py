@@ -4,13 +4,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import pandas as pd
+import argparse
 import os
 
 sns.set(style='whitegrid')
 sns.set_palette(sns.color_palette('bright'))
 
 def main(results_dir):
-    app_latency_files = Path(result_dir).rglob('app_exec_times.csv')
+    app_latency_files = Path(results_dir).rglob('app_exec_times.csv')
 
     agg_df = pd.DataFrame()
     for f in app_latency_files:
@@ -22,7 +23,7 @@ def main(results_dir):
     agg_df['norm_runtime'] = agg_df.apply(
             lambda x: x['latency'] / agg_df.loc[(agg_df.system=='noswap') &
                 (agg_df.memory==x['memory']), 'latency'].values[0], axis=1)
-    agg_df['rmem_ratio'] = (agg_df['memory'] - 280) / agg_df['memory']
+    agg_df['rmem_ratio'] = (agg_df.memory - 280) / agg_df.memory
     agg_df['rmem_ratio'] = agg_df['rmem_ratio'].apply(lambda x: "{0:.2f}%".format(x*100))
 
     agg_df.reset_index(drop=True, inplace=True)

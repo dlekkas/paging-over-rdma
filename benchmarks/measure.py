@@ -48,7 +48,7 @@ def add_row(table, row_name, latencies):
 
 def main(ack_latencies_file, store_latencies_file, load_latencies_file):
     table = BeautifulTable()
-    table.column_headers = ['', 'avg [us]', 'min [us]', 'median [us]',
+    table.column_headers = ['', 'min [us]', 'avg [us]', 'median [us]',
             'p90 [us]', 'p99 [us]', 'p99.9 [us]',  'p99.99', 'max [us]']
 
     if ack_latencies_file is not None:
