@@ -73,6 +73,11 @@ class ConnectionRDMA {
 	}
 };
 
+struct ib_mcast_group {
+	uint8_t gid_raw[16];
+	uint16_t lid;
+	uint32_t qkey;
+};
 
 class ServerRDMA {
 
@@ -106,11 +111,9 @@ class ServerRDMA {
 	// client about the memory address, length and lkey.
 	int send_mem_info(struct ibv_qp *qp);
 
-	int recv_mcast_grp_info(struct ibv_qp *qp);
-
 	int recv_mcast_dummy_msg();
 
-	void join_mcast_group();
+	int join_mcast_group(struct ib_mcast_group *mcast_grp);
 
 	int send_control_msg(comm_ctrl_opcode op);
 
@@ -166,11 +169,7 @@ class ServerRDMA {
 
 	int curr_idx_;
 
-	struct mcast_grp_info {
-		uint8_t gid_raw[16];
-		uint16_t lid;
-		uint32_t qkey;
-	} mcast_info_msg;
+	struct ib_mcast_group mcast_info_msg;
 };
 
 // Helper function mainly used to ensure that we are not polling forever
@@ -332,19 +331,22 @@ int ServerRDMA::on_connect_request(struct rdma_cm_id *client_cm_id,
 	conn_param.private_data = NULL;
 	conn_param.private_data_len = 0;
 	conn_param.responder_resources = param->responder_resources;
-	if (conn_param.responder_resources == 0) {
-		std::cout << "responder_resources = 0.\n";
-	}
 	conn_param.initiator_depth = param->initiator_depth;
-	if (conn_param.initiator_depth == 0) {
-		std::cout << "initiator_depth = 0.\n";
-	}
 	conn_param.flow_control = param->flow_control;
 	conn_param.rnr_retry_count = param->rnr_retry_count;
 
 	if (rdma_accept(client_cm_id, &conn_param)) {
 		std::cerr << "rdma_accept() failed: " << std::strerror(errno) << "\n";
 		return 1;
+	}
+
+	// the private data should contain multicast group information for the
+	// memory server to be able to join the multicast group
+	if (param->private_data_len > 0) {
+		memcpy(&mcast_info_msg, param->private_data, param->private_data_len);
+	} else {
+		std::cerr << "multicast info not sent on connect request\n";
+		return -1;
 	}
 
 	return 0;
@@ -417,35 +419,6 @@ int ServerRDMA::recv_mcast_dummy_msg() {
 	return 0;
 }
 
-int ServerRDMA::recv_mcast_grp_info(struct ibv_qp *qp) {
-	struct ibv_sge sg;
-	struct ibv_recv_wr wr;
-	struct ibv_recv_wr *bad_wr;
-
-	struct ibv_mr *recv_mr;
-	recv_mr = ibv_reg_mr(pd_, &mcast_info_msg, sizeof(mcast_info_msg),
-			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-	if (recv_mr == nullptr) {
-		std::cerr << "ibv_reg_mr failed.\n";
-	}
-
-	sg.addr = reinterpret_cast<uint64_t>(&mcast_info_msg);
-	sg.length = sizeof(mcast_info_msg);
-	sg.lkey = recv_mr->lkey;
-
-	wr.wr_id = 200;
-	wr.next = NULL;
-	wr.sg_list = &sg;
-	wr.num_sge = 1;
-
-	if (ibv_post_recv(qp, &wr, &bad_wr)) {
-		std::cerr << "ibv_post_recv() failed.\n";
-		return -1;
-	}
-
-	return 0;
-}
-
 int ServerRDMA::send_mem_info(struct ibv_qp *qp) {
 
 	std::cout << "Invoking InitUDP()\n";
@@ -509,42 +482,21 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 			// Upon receiving a REQ message, we can allocate a QP and accept the
 			// incoming connection request.
+			std::cout << "Received connection request.\n";
 			on_connect_request(ev_cm_id, &ev->param.conn);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
-			// Upon receiving a message that connection is established, we can
-			// acknowledge the event back to the client. The call below also frees
-			// the event structure and any memory it references.
 			std::cout << "Connection established.\n";
-
-			if (recv_mcast_grp_info(ev_cm_id->qp)) {
-				std::cout << "Failed to post RR for multicast group info.\n";
-			}
-
 			if (send_mem_info(ev_cm_id->qp)) {
 				std::cout << "Failed to exchange memory region info.\n";
-			} else {
-				std::cout << "Memory region info sent successfully.\n";
 			}
 
-			struct ibv_wc wc;
-			while (!ibv_poll_cq(ev_cm_id->qp->recv_cq, 1, &wc)) {
-				// nothing
-			}
-
-			if (wc.status != IBV_WC_SUCCESS) {
-				std::cerr << "Polling failed with status " << ibv_wc_status_str(wc.status)
-									<< ", work request ID: " << wc.wr_id << std::endl;
+			if (join_mcast_group(&mcast_info_msg)) {
+				std::cerr << "failed to join multicast group\n";
 				return -1;
 			}
 
-			std::cout << "Received message with wr_id = " << wc.wr_id << "\n";
-			std::cout << "lid = " << mcast_info_msg.lid << "\n";
-			std::cout << "qkey = " << mcast_info_msg.qkey << "\n";
-
-			join_mcast_group();
-			recv_mcast_dummy_msg();
-
+			// n_conns_++;
 			clients_.emplace_back(ev_cm_id, ev_cm_id->qp, ev_cm_id->qp->pd);
 			break;
 		case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -564,8 +516,6 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 			std::memcpy(mgid.raw, mcast_info_msg.gid_raw, 16);
 			if (ibv_attach_mcast(mcast_qp_, &mgid, mcast_info_msg.lid)) {
 				std::cerr << "ibv_attach_mcast() failed.\n";
-			} else {
-				std::cout << "Attached to mcast group successfully.\n";
 			}
 			send_control_msg(MCAST_MEMBERSHIP_ACK);
 			n_conns_++;
@@ -581,12 +531,15 @@ int ServerRDMA::cm_event_handler(struct rdma_cm_event *ev) {
 }
 
 void ServerRDMA::init_mcast_rdma_resources() {
-	/*
 	if (rdma_create_id(ev_channel_, &mcast_cm_id_, NULL, RDMA_PS_UDP)) {
 		std::cerr << "rdma_create_id() failed: " << std::strerror(errno) << "\n";
 		return;
 	}
-	*/
+
+	// Bind the RDMA CM identifier to the source address and port.
+	if (rdma_bind_addr(mcast_cm_id_, &src_addr_)) {
+		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
+	}
 
 	if (!pd_) {
 		std::cerr << "Protection domain not initialized.\n";
@@ -594,43 +547,16 @@ void ServerRDMA::init_mcast_rdma_resources() {
 	}
 
 	mcast_cq_ = ibv_create_cq(pd_->context, MIN_CQE, NULL, NULL, 0);
-	if (!cq_) {
+	if (!mcast_cq_) {
 		std::cerr << "ibv_create_cq failed: " << std::strerror(errno) << "\n";
 		return;
-		// std::exit(EXIT_FAILURE);
 	}
-
-	std::cout << "mcast CQE = " << mcast_cq_->cqe << "\n";
-
-	/*
-	std::string ip("192.168.1.20");
-	struct rdma_addrinfo hints;
-	hints.ai_port_space = RDMA_PS_UDP;
-	hints.ai_flags = RAI_PASSIVE;
-
-	struct rdma_addrinfo *res;
-	std::cout << "getaddrinfo()\n";
-	if (rdma_getaddrinfo(ip.c_str(), NULL, &hints, &res)) {
-		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
-	}
-	*/
-
-	/*
-	struct sockaddr_in sa;
-	inet_pton(AF_INET, "192.168.1.20", &(sa.sin_addr));
-
-	std::cout << "bindaddr()\n";
-	if (rdma_bind_addr(mcast_cm_id_, (struct sockaddr *) &sa)) {
-		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
-	}
-	std::cout << "done\n";
-	*/
 
 	struct ibv_qp_init_attr attr;
 	std::memset(&attr, 0, sizeof(attr));
 	attr.send_cq = mcast_cq_;
 	attr.recv_cq = mcast_cq_;
-	attr.srq = NULL;
+	attr.srq = nullptr;
 	attr.cap.max_send_wr = 0;
 	attr.cap.max_recv_wr = 8192;
 	attr.cap.max_send_sge = 0;
@@ -639,25 +565,22 @@ void ServerRDMA::init_mcast_rdma_resources() {
 	attr.qp_type = IBV_QPT_UD;
 	attr.sq_sig_all = 0;
 	if (rdma_create_qp(mcast_cm_id_, pd_, &attr)) {
-		std::cerr << "[2]rdma_create_qp() failed: " << std::strerror(errno) << "\n";
+		std::cerr << "rdma_create_qp for multicast failed: " <<
+			std::strerror(errno) << "\n";
 	}
-
 	mcast_qp_ = mcast_cm_id_->qp;
 }
 
-void ServerRDMA::join_mcast_group() {
+int ServerRDMA::join_mcast_group(struct ib_mcast_group *mcast_grp) {
 	init_mcast_rdma_resources();
 
-	std::cout << "init_mcast_rdma_resources() finished successfully.\n";
-
-	char addr_buf[INET6_ADDRSTRLEN];
-	if (!inet_ntop(AF_INET6, mcast_info_msg.gid_raw,
-				addr_buf, INET6_ADDRSTRLEN)) {
+	char addr[INET6_ADDRSTRLEN];
+	if (!inet_ntop(AF_INET6, mcast_grp->gid_raw, addr, INET6_ADDRSTRLEN)) {
 		std::cerr << "inet_ntop failed to convert multicast address.\n";
+		return -1;
 	}
 
-	std::string mcast_addr_str(addr_buf);
-	std::cout << "mcast grp addr = " << mcast_addr_str << "\n";
+	std::cout << "trying to join mcast grp: " << std::string(addr) << "\n";
 
 	struct rdma_addrinfo hints;
 	std::memset(&hints, 0, sizeof(hints));
@@ -665,8 +588,9 @@ void ServerRDMA::join_mcast_group() {
 	hints.ai_flags = 0;
 
 	struct rdma_addrinfo *addrinfo;
-	if (rdma_getaddrinfo(mcast_addr_str.c_str(), NULL, &hints, &addrinfo)) {
+	if (rdma_getaddrinfo(addr, NULL, &hints, &addrinfo)) {
 		std::cerr << "rdma_getaddrinfo() failed: " << std::strerror(errno) << "\n";
+		return -1;
 	}
 	mcast_addr_ = addrinfo->ai_dst_addr;
 
@@ -678,8 +602,9 @@ void ServerRDMA::join_mcast_group() {
 	if (rdma_join_multicast_ex(mcast_cm_id_, &mc_join_attr, NULL)) {
 		std::cerr << "rdma_join_multicast_ex() failed: "
 			<< std::strerror(errno) << "\n";
+		return -1;
 	}
-	std::cout << "rdma_join_multicast_ex.\n";
+	return 0;
 }
 
 int ServerRDMA::setup_mem_region(std::size_t buf_size) {
@@ -728,10 +653,12 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 		std::exit(EXIT_FAILURE);
 	}
 
+	/*
 	if (rdma_create_id(ev_channel_, &mcast_cm_id_, NULL, RDMA_PS_UDP)) {
 		std::cerr << "rdma_create_id() failed: " << std::strerror(errno) << "\n";
 		return;
 	}
+	*/
 
 	struct rdma_addrinfo hints;
 	std::memset(&hints, 0, sizeof(hints));
@@ -750,11 +677,14 @@ void ServerRDMA::Listen(const std::string& ip_addr, int port) {
 		std::cerr << "rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
 		std::exit(EXIT_FAILURE);
 	}
+	src_addr_ = *res->ai_src_addr;
 
 	// Bind the RDMA CM identifier to the source address and port.
+	/*
 	if (rdma_bind_addr(mcast_cm_id_, res->ai_src_addr)) {
 		std::cerr << "[2]rdma_bind_addr() failed: " << std::strerror(errno) << "\n";
 	}
+	*/
 
 	// Start listening for incoming connection requests while allowing for a
 	// maximum of MAX_QUEUED_CONNECT_REQUESTS to be kept in kernel queue for
@@ -807,6 +737,7 @@ int ServerRDMA::WaitForClients(int n_clients) {
 
 	std::cout << "Polling for mcast dummy msg (wait up to 10s).\n";
 
+	/*
 	struct ibv_wc wc;
 	int timeout_ms = 10000;
 	int ret = poll_cq_with_timeout(mcast_cq_, 1, &wc, timeout_ms);
@@ -822,6 +753,7 @@ int ServerRDMA::WaitForClients(int n_clients) {
 		std::cout << "Received mcast message with wr_id = " << wc.wr_id << "\n";
 		std::cout << "Message = " << &mcast_msg[sizeof(struct ibv_grh)] << "\n";
 	}
+	*/
 
 	return n_conns_;
 }
@@ -891,7 +823,7 @@ int ServerRDMA::post_page_recv_requests_fast(struct ibv_qp* qp,
 
 	struct ibv_recv_wr *bad_wr;
 
-	int n_batches = n_wrs / blk_sz + (n_wrs % blk_sz == 0);
+	int n_batches = n_wrs / blk_sz + (n_wrs % blk_sz != 0);
 	for (int i = 0; i < n_batches; i++) {
 		for (int j = 0; j < blk_sz; j++) {
 			uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) +
@@ -1168,8 +1100,10 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Polling for 120sec." << std::endl;
-	server.Poll(120);
+	// std::cout << "Polling for 120sec." << std::endl;
+	// server.Poll(120);
+	std::chrono::milliseconds sleep_ms(5000);
+	std::this_thread::sleep_for(sleep_ms);
 
 	return 0;
 }

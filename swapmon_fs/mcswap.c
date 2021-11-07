@@ -199,6 +199,12 @@ struct mem_info {
 	u32 key;
 };
 
+#define mcswap_server_debug(msg, ctx)				\
+	pr_info("server %s:%d %s\n", (ctx)->ip, (ctx)->port, msg)
+
+#define mcswap_server_warn(msg, ctx)				\
+	pr_warn("server %s:%d %s\n", (ctx)->ip, (ctx)->port, msg)
+
 struct server_ctx {
 	struct rdma_cm_id *id;
 	struct ib_qp *qp;
@@ -214,6 +220,9 @@ struct server_ctx {
 	struct completion mcast_ack;
 	struct ib_cqe cqe;
 	int cm_error;
+
+	char *ip;
+	int port;
 };
 
 struct mcswap_route_info {
@@ -839,7 +848,7 @@ MODULE_PARM_DESC(enable_async_mode, "Enable asynchronous stores/loads "
 /*-------------------------------------------------------------*/
 
 
-static int swapmon_rdma_parse_ipaddr(struct sockaddr_in *saddr, char *ip) {
+static int mcswap_parse_ip_addr(struct sockaddr_in *saddr, char *ip) {
   u8 *addr = (u8 *) &saddr->sin_addr.s_addr;
   size_t buflen = strlen(ip);
 	int ret;
@@ -1023,7 +1032,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 		return -ENOTSUPP;
 	}
 
-	pr_info("UD Multicast membership info: dgid = %16phC, mlid = 0x%x, "
+	pr_info("IB multicast group info: dgid = %16phC, mlid = 0x%x, "
 			"sl = %d, src_path_bits = %u, qpn = %u, qkey = %u\n",
 			param->ah_attr.grh.dgid.raw, param->ah_attr.ib.dlid,
 			rdma_ah_get_sl(&param->ah_attr), rdma_ah_get_path_bits(&param->ah_attr),
@@ -1121,10 +1130,21 @@ static int recv_mem_info(struct server_ctx *ctx, struct ib_qp *qp) {
 static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 		struct rdma_cm_event *event) {
 	struct server_ctx *ctx;
+	struct mcast_ctx *mctx;
 	int cm_error = 0;
 	int ret;
-	printk("%s msg: %s (%d) status %d id $%p\n", __func__,
-				 rdma_event_msg(event->event), event->event, event->status, id);
+
+	if (id->qp_type == IB_QPT_RC) {
+		ctx = id->context;
+		pr_debug("%s [%s:%d]: %s (%d) status %d id $%p\n", __func__,
+				ctx->ip, ctx->port, rdma_event_msg(event->event),
+				event->event, event->status, id);
+	} else if (id->qp_type == IB_QPT_UD) {
+		mctx = id->context;
+		pr_debug("%s : %s (%d) status %d id $%p\n", __func__,
+				rdma_event_msg(event->event), event->event,
+				event->status, id);
+	}
 
 	switch (event->event) {
 		case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -1135,12 +1155,12 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			ctx = id->context;
-			pr_info("connection established successfully\n");
-			// Wait to receive memory info to retrieve all required info to properly
-			// reference remote memory.
+			mcswap_server_debug("connected", (struct server_ctx*) id->context);
+			// wait to receive memory info to retrieve all required
+			// info to properly reference remote memory.
 			ret = recv_mem_info(ctx, id->qp);
 			if (ret) {
-				pr_err("unable to receive remote mem info.\n");
+				mcswap_server_debug("failed to receive memory info", ctx);
 			}
 			ctx->cm_error = ret;
 			complete(&ctx->cm_done);
@@ -1149,26 +1169,24 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_ADDR_ERROR:
 		case RDMA_CM_EVENT_CONNECT_REQUEST:
 		case RDMA_CM_EVENT_CONNECT_RESPONSE:
-			pr_info("successful response to the connection request (REQ).\n");
 			break;
 		case RDMA_CM_EVENT_CONNECT_ERROR:
-			pr_err("error while trying to establish connection.\n");
+			mcswap_server_warn("failed to connect",
+					(struct server_ctx*) id->context);
 			break;
 		case RDMA_CM_EVENT_UNREACHABLE:
-			pr_info("remote server is unreachable or unable to respond to \
-					connection request.\n");
 			break;
 		case RDMA_CM_EVENT_REJECTED:
-			pr_info("Connection request or response rejected by remote endpoint.\n");
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
-			pr_info("RDMA connection was closed.\n");
+			// TODO(dimlek): we need to do some cleanup of resources here
+			mcswap_server_debug("disconnected",
+					(struct server_ctx*) id->context);
 			break;
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
 			break;
 		case RDMA_CM_EVENT_MULTICAST_JOIN:
-			pr_info("multicast join operation completed successfully\n");
-			// post_recv_control_msg(1);
+			pr_debug("multicast join operation completed successfully\n");
 			cm_error = mcswap_mcast_join_handler(event, id->context);
 			ctrl->cm_error = cm_error;
 			complete(&ctrl->mcast_done);
@@ -1179,7 +1197,7 @@ static int mcswap_cm_event_handler(struct rdma_cm_id *id,
 		case RDMA_CM_EVENT_TIMEWAIT_EXIT:
 			break;
 		default:
-			pr_err("received unrecognized RDMA CM event %d\n", event->event);
+			pr_err("unrecognized RDMA CM event %d\n", event->event);
 			break;
 	}
 
@@ -1213,11 +1231,11 @@ static void recv_control_msg_done(struct ib_cq* cq, struct ib_wc* wc) {
 	op = ntohl(wc->ex.imm_data);
 	switch(op) {
 		case MCAST_MEMBERSHIP_ACK:
-			pr_info("mem server joined multicast group.\n");
+			mcswap_server_debug("joined multicast group", ctx);
 			complete(&ctx->mcast_ack);
 			break;
 		case MCAST_MEMBERSHIP_NACK:
-			pr_info("Mem server failed to join multicast group.\n");
+			mcswap_server_warn("failed to join multicast group", ctx);
 			break;
 		default:
 			pr_err("(%s) unrecognized control message with op: %u\n",
@@ -1295,23 +1313,19 @@ static int __init mcswap_wait_for_rc_establishment(struct server_ctx *ctx) {
 	return 0;
 }
 
-static int __init mcswap_rdma_bind_addr(struct rdma_cm_id *id,
-		struct sockaddr_in *sin, char *ip) {
-	int ret = swapmon_rdma_parse_ipaddr(sin, ip);
-	if (ret) {
-		pr_err("failed to parse client ip addr %s (code = %d)\n",
-				client_ip, ret);
-		return ret;
-	}
-
-	ret = rdma_bind_addr(id, (struct sockaddr *) sin);
-	if (ret) {
-		pr_err("rdma_bind_addr failed: %d\n", ret);
-		return ret;
+static int __init mcswap_wait_for_server_mcast_ack(struct server_ctx *ctx) {
+	int wait_ret = wait_for_completion_interruptible_timeout(&ctx->mcast_ack,
+			msecs_to_jiffies(MCSWAP_MCAST_JOIN_TIMEOUT_MS) + 1);
+	if (wait_ret == 0) {
+		pr_err("server %s:%d multicast join timeout\n", ctx->ip, ctx->port);
+		return -ETIME;
+	} else if (wait_ret == -ERESTARTSYS) {
+		pr_err("interrupted on server %s:%d multicast join waiting\n",
+				ctx->ip, ctx->port);
+		return wait_ret;
 	}
 	return 0;
 }
-
 
 static int mcswap_check_hca_support(struct ib_device *dev, u8 port_num) {
 	struct ib_port_attr port_attr;
@@ -1357,9 +1371,10 @@ static int __init mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
 		return -ENODEV;
 	}
 
-	ret = mcswap_rdma_bind_addr(mctx->cm_id,
-			&ctrl->client_addr, client_ip);
+	ret = rdma_bind_addr(mctx->cm_id, (struct sockaddr *)
+			&ctrl->client_addr);
 	if (ret) {
+		pr_err("rdma_bind_addr failed: %d\n", ret);
 		goto destroy_mcast_cm_id;
 	}
 
@@ -1483,10 +1498,9 @@ static void __exit mcswap_destroy_caches(void) {
 }
 
 
-static int __init mcswap_server_connect(
-		struct server_ctx *ctx, char *ip, int port) {
+static int __init mcswap_server_connect( struct server_ctx *ctx) {
 	int ret;
-	pr_info("%s(ip=%s, port=%d)\n", __func__, ip, port);
+	pr_info("%s(ip=%s, port=%d)\n", __func__, ctx->ip, ctx->port);
 	ctx->id = rdma_create_id(&init_net, mcswap_cm_event_handler,
 			ctx, RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(ctx->id)) {
@@ -1494,18 +1508,12 @@ static int __init mcswap_server_connect(
 		return -ENODEV;
 	}
 
-	ret = swapmon_rdma_parse_ipaddr(&ctx->sin_addr, ip);
+	ret = mcswap_parse_ip_addr(&ctx->sin_addr, ctx->ip);
 	if (ret) {
-		pr_err("failed to parse server ip addr %s (code = %d)\n", ip, ret);
+		pr_err("failed to parse server ip addr %s (code = %d)\n", ctx->ip, ret);
 		goto destroy_cm_id;
 	}
-	ctx->sin_addr.sin_port = cpu_to_be16(port);
-
-	ret = swapmon_rdma_parse_ipaddr(&ctrl->client_addr, client_ip);
-	if (ret) {
-		pr_err("failed to parse client ip addr %s (code = %d)\n", client_ip, ret);
-		goto destroy_cm_id;
-	}
+	ctx->sin_addr.sin_port = cpu_to_be16(ctx->port);
 
 	// Resolve destination and optionally source addresses from IP addresses to an
 	// RDMA address and if the resolution is successful, then the RDMA cm id will
@@ -1531,13 +1539,44 @@ static int __init mcswap_server_connect(
 	init_completion(&ctx->mcast_ack);
 	ret = mcswap_post_recv_control_msg(ctx);
 	if (ret) {
-		goto destroy_cm_id;
+		goto destroy_mcast_resources;
+	}
+
+	// block until the remote memory server joins the multicast group or
+	// until the timeout to join expires
+	ret = mcswap_wait_for_server_mcast_ack(ctx);
+	if (ret) {
+		goto destroy_mcast_resources;
 	}
 	return 0;
 
+destroy_mcast_resources:
+	// TODO(dimlek): destroy resources here
 destroy_cm_id:
 	rdma_destroy_id(ctx->id);
 	return ret;
+}
+
+static int __init mcswap_parse_module_params(void) {
+	int i, ret;
+	ctrl->n_servers = nr_servers;
+	if (ctrl->n_servers > MAX_NR_SERVERS) {
+		pr_warn("max memory servers allowed: %d\n", MAX_NR_SERVERS);
+		return -ENOTSUPP;
+	}
+
+	ret = mcswap_parse_ip_addr(&ctrl->client_addr, client_ip);
+	if (ret) {
+		pr_err("failed to parse client_ip addr %s (code = %d)\n",
+				client_ip, ret);
+		return ret;
+	}
+
+	for (i = 0; i < ctrl->n_servers; i++) {
+		ctrl->server[i].ip = server_ip[i];
+		ctrl->server[i].port = server_port;
+	}
+	return 0;
 }
 
 static int __init mcswap_init(void) {
@@ -1547,11 +1586,10 @@ static int __init mcswap_init(void) {
 		return ret;
 	}
 
-	if (nr_servers > MAX_NR_SERVERS) {
-		pr_warn("max supported memory servers: %d\n", MAX_NR_SERVERS);
-		nr_servers = MAX_NR_SERVERS;
+	ret = mcswap_parse_module_params();
+	if (ret) {
+		return ret;
 	}
-	ctrl->n_servers = nr_servers;
 
 	ret = mcswap_rdma_mcast_init(&ctrl->mcast);
 	if (ret) {
@@ -1560,13 +1598,10 @@ static int __init mcswap_init(void) {
 	}
 
 	for (i = 0; i < ctrl->n_servers; i++) {
-		ret = mcswap_server_connect(&ctrl->server[i],
-				server_ip[i], server_port);
+		ret = mcswap_server_connect(&ctrl->server[i]);
 		if (ret)
 			goto destroy_mcast_resources;
-		pr_info("connected successfully to server %s\n", server_ip[i]);
 	}
-	pr_info("module loaded\n");
 
 	return 0;
 
