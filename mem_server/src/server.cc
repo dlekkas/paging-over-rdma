@@ -1100,10 +1100,7 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	// std::cout << "Polling for 120sec." << std::endl;
-	// server.Poll(120);
-	std::chrono::milliseconds sleep_ms(5000);
-	std::this_thread::sleep_for(sleep_ms);
-
+	std::cout << "Polling for 60sec." << std::endl;
+	server.Poll(60);
 	return 0;
 }

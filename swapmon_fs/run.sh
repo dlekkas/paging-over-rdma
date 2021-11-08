@@ -32,8 +32,8 @@ make clean && make
 MODULE_FILENAME=`modinfo -F filename *.ko`
 
 # insert module
-sudo insmod ${MODULE_FILENAME} sport=${SERVER_PORT} \
-	server=${SERVER_IP} cip=${CLIENT_IP}
+sudo insmod ${MODULE_FILENAME} cip=${CLIENT_IP} \
+	endpoint=${SERVER_IP}:${SERVER_PORT} enable_async_mode=1
 if [ $? -ne 0 ]; then
 	echo "Error when inserting module, use 'dmesg' command for kernel logs"
 fi
