@@ -44,7 +44,7 @@
 #define MCSWAP_MAX_SEND_RETRIES 3
 #define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
 
-#define MCSWAP_MCAST_JOIN_TIMEOUT_MS 5000
+#define MCSWAP_MCAST_JOIN_TIMEOUT_SEC 5
 #define MCSWAP_MAX_MCAST_CQE 12288
 
 #ifdef CONFIG_DEBUG_FS
@@ -492,6 +492,8 @@ static int swapmon_store_sync(unsigned swap_type, pgoff_t offset,
 		}
 		mcswap_sent_pages++;
 
+		// do some polling here instead of waiting for the req to be done
+
 		wait_ret = wait_for_completion_interruptible_timeout(&req->ack,
 				msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
 		if (unlikely(wait_ret == -ERESTARTSYS)) {
@@ -640,8 +642,8 @@ static int mcswap_rdma_read_sync(struct page *page,
 	struct rdma_req *req;
 	struct ib_sge sge;
 	u64 dma_addr;
-	long wait_ret;
-	int ret;
+	long wait_ret = 0;
+	int ret = 0;
 
   dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
 			PAGE_SIZE, DMA_BIDIRECTIONAL);
@@ -683,6 +685,14 @@ static int mcswap_rdma_read_sync(struct page *page,
 		return ret;
 	}
 
+	if (sctx->recv_cq->poll_ctx == IB_POLL_DIRECT) {
+		while (!try_wait_for_completion(&req->done)) {
+		  ib_process_cq_direct(sctx->recv_cq, 16);
+			cpu_relax();
+		}
+		return ret;
+	}
+
 	wait_ret = wait_for_completion_interruptible_timeout(&req->done,
 			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
 	if (unlikely(wait_ret == -ERESTARTSYS)) {
@@ -693,7 +703,7 @@ static int mcswap_rdma_read_sync(struct page *page,
 		return -ETIME;
 	}
 
-	return 0;
+	return ret;
 }
 
 
@@ -714,12 +724,22 @@ static int __mcswap_load_sync(unsigned swap_type, pgoff_t offset,
 	spin_lock_bh(&tree->lock);
 	entry = rb_find_page_remote_info(&tree->root, offset);
 	if (!entry) {
-		pr_err("failed to find page metadata in red-black tree.\n");
+		pr_err("failed to find page metadata in red-black tree\n");
 		spin_unlock_bh(&tree->lock);
-		return -1;
+		return -EEXIST;
 	}
 	spin_unlock_bh(&tree->lock);
 	sctx = &ctrl->server[entry->sidx];
+
+	/*
+	if (!PageReadahead(page)) {
+		ret = mcswap_rdma_read_sync(page, entry, sctx);
+	} else {
+		//ret = mcswap_rdma_read_async(page, entry, sctx);
+		ClearPageWaiters(page);
+		// TODO(dimlek): !!!!! insert a page waiter before unlocking page in mcswap_read_done
+	}
+	*/
 
 	ret = mcswap_rdma_read_sync(page, entry, sctx);
 	if (unlikely(ret)) {
@@ -850,6 +870,9 @@ module_param(enable_async_mode, int, 0644);
 MODULE_PARM_DESC(enable_async_mode, "Enable asynchronous stores/loads "
 		"but requires appropriate kernel patch (default=0)");
 
+static int enable_poll_mode = 0;
+module_param(enable_poll_mode, int, 0644);
+
 /*-------------------------------------------------------------*/
 
 
@@ -915,6 +938,7 @@ static int mcswap_rc_create_qp(struct server_ctx *ctx) {
 
 static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 	struct server_ctx *ctx = cm_id->context;
+	enum ib_poll_context poll_ctx;
 	int comp_vector = 0;
 	int ret;
 
@@ -949,8 +973,9 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 		goto out_err;
 	}
 
+	poll_ctx = enable_poll_mode ? IB_POLL_DIRECT : IB_POLL_SOFTIRQ;
 	ctx->recv_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
-			comp_vector, IB_POLL_SOFTIRQ);
+			comp_vector, poll_ctx);
 	if (IS_ERR(ctx->recv_cq)) {
 		ret = PTR_ERR(ctx->recv_cq);
 		goto out_destroy_send_cq;
@@ -1297,8 +1322,8 @@ static struct ib_qp* __init mcswap_create_mcast_qp(
 }
 
 static int mcswap_wait_for_mcast_join(void) {
-	int wait_ret = wait_for_completion_interruptible_timeout(
-			&ctrl->mcast_done, msecs_to_jiffies(MCSWAP_MCAST_JOIN_TIMEOUT_MS) + 1);
+	int wait_ret = wait_for_completion_interruptible_timeout(&ctrl->mcast_done,
+			msecs_to_jiffies(MCSWAP_MCAST_JOIN_TIMEOUT_SEC * 1000) + 1);
 	if (wait_ret == 0) {
 		pr_err("timed out on multicast join waiting\n");
 		return -ETIME;
@@ -1323,8 +1348,25 @@ static int __init mcswap_wait_for_rc_establishment(struct server_ctx *ctx) {
 }
 
 static int __init mcswap_wait_for_server_mcast_ack(struct server_ctx *ctx) {
-	int wait_ret = wait_for_completion_interruptible_timeout(&ctx->mcast_ack,
-			msecs_to_jiffies(MCSWAP_MCAST_JOIN_TIMEOUT_MS) + 1);
+	struct timespec ts_start, ts_now;
+	int wait_ret;
+
+	if (ctx->recv_cq->poll_ctx == IB_POLL_DIRECT) {
+		getnstimeofday(&ts_start);
+		while (!try_wait_for_completion(&ctx->mcast_ack)) {
+		  ib_process_cq_direct(ctx->recv_cq, 1);
+			getnstimeofday(&ts_now);
+			if (ts_now.tv_sec - ts_start.tv_sec >=
+					MCSWAP_MCAST_JOIN_TIMEOUT_SEC) {
+				return -ETIME;
+			}
+			cpu_relax();
+		}
+		return 0;
+	}
+
+	wait_ret = wait_for_completion_interruptible_timeout(&ctx->mcast_ack,
+			msecs_to_jiffies(MCSWAP_MCAST_JOIN_TIMEOUT_SEC * 1000) + 1);
 	if (wait_ret == 0) {
 		pr_err("server %s:%d multicast join timeout\n", ctx->ip, ctx->port);
 		return -ETIME;
@@ -1333,6 +1375,7 @@ static int __init mcswap_wait_for_server_mcast_ack(struct server_ctx *ctx) {
 				ctx->ip, ctx->port);
 		return wait_ret;
 	}
+
 	return 0;
 }
 
@@ -1632,7 +1675,6 @@ static int __init mcswap_init(void) {
 		if (ret)
 			goto destroy_mcast_resources;
 	}
-	return 0;
 
 	if (enable_async_mode) {
 		frontswap_register_ops(&mcswap_async_ops);
