@@ -30,6 +30,7 @@
 #include <linux/smp.h>
 #include <linux/inet.h>
 #include <linux/delay.h>
+#include <linux/version.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
@@ -292,7 +293,11 @@ static void swapmon_mcast_done(struct ib_cq *cq, struct ib_wc *wc) {
 
 static int mcswap_mcast_send_page(struct page *page, pgoff_t offset) {
 	struct mcast_ctx *mc_ctx = &ctrl->mcast;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	const struct ib_send_wr *bad_wr;
+#else
 	struct ib_send_wr *bad_wr;
+#endif
 	struct ib_ud_wr ud_wr;
 	struct ib_sge sge;
 	u64 dma_addr;
@@ -407,7 +412,11 @@ static void page_ack_done(struct ib_cq *cq, struct ib_wc *wc) {
 
 
 static int mcswap_post_recv_page_ack(struct page_ack_req *req) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	const struct ib_recv_wr *bad_wr;
+#else
 	struct ib_recv_wr *bad_wr;
+#endif
 	struct ib_recv_wr wr;
 	struct ib_sge sge;
 	struct mcswap_entry *ent;
@@ -618,7 +627,6 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 				 atomic_read(&mcswap_stored_pages), __func__,
 				 swap_type, offset);
 				 */
-	atomic_inc(&mcswap_stored_pages);
 
 	return 0;
 }
@@ -637,7 +645,11 @@ static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 
 static int mcswap_rdma_read_sync(struct page *page,
 		struct mcswap_entry *ent, struct server_ctx *sctx) {
-	struct ib_send_wr *bad_send_wr;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	const struct ib_send_wr *bad_wr;
+#else
+	struct ib_send_wr *bad_wr;
+#endif
 	struct ib_rdma_wr rdma_wr;
 	struct rdma_req *req;
 	struct ib_sge sge;
@@ -679,15 +691,15 @@ static int mcswap_rdma_read_sync(struct page *page,
 	rdma_wr.remote_addr = ent->info.remote_addr;
 	rdma_wr.rkey = ent->info.rkey;
 
-	ret = ib_post_send(sctx->qp, &rdma_wr.wr, &bad_send_wr);
+	ret = ib_post_send(sctx->qp, &rdma_wr.wr, &bad_wr);
 	if (unlikely(ret)) {
 		pr_err("ib_post_send failed to read remote page\n");
 		return ret;
 	}
 
-	if (sctx->recv_cq->poll_ctx == IB_POLL_DIRECT) {
+	if (sctx->send_cq->poll_ctx == IB_POLL_DIRECT) {
 		while (!try_wait_for_completion(&req->done)) {
-		  ib_process_cq_direct(sctx->recv_cq, 16);
+		  ib_process_cq_direct(sctx->send_cq, 16);
 			cpu_relax();
 		}
 		return ret;
@@ -1080,7 +1092,13 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 
 	mc_ctx->qpn  = param->qp_num;
 	mc_ctx->qkey = param->qkey;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr,
+			RDMA_CREATE_AH_SLEEPABLE);
+#else
 	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr);
+#endif
 	if (!mc_ctx->ah) {
 		pr_err("failed to create address handle for multicast\n");
 		return -ENOENT;
@@ -1090,7 +1108,11 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 }
 
 static int recv_mem_info(struct server_ctx *ctx, struct ib_qp *qp) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	const struct ib_recv_wr *bad_wr;
+#else
 	struct ib_recv_wr *bad_wr;
+#endif
 	struct ib_recv_wr wr;
 	struct ib_sge sge;
 	struct ib_wc wc;
@@ -1279,7 +1301,12 @@ static void recv_control_msg_done(struct ib_cq* cq, struct ib_wc* wc) {
 }
 
 static int mcswap_post_recv_control_msg(struct server_ctx *ctx) {
-	struct ib_recv_wr wr, *bad_wr;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	const struct ib_recv_wr *bad_wr;
+#else
+	struct ib_recv_wr *bad_wr;
+#endif
+	struct ib_recv_wr wr;
 	int ret;
 
 	wr.next    = NULL;
@@ -1480,7 +1507,11 @@ static int mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
 	return 0;
 
 destroy_mcast_ah:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+	rdma_destroy_ah(mctx->ah, RDMA_DESTROY_AH_SLEEPABLE);
+#else
 	rdma_destroy_ah(mctx->ah);
+#endif
 leave_mcast_grp:
 	rdma_leave_multicast(mctx->cm_id,
 			(struct sockaddr *) &ctrl->mcast_addr);
@@ -1539,11 +1570,11 @@ exit:
 	return -ENOMEM;
 }
 
-static void __exit mcswap_destroy_mcast_resources(void) {
+static void mcswap_destroy_mcast_resources(void) {
 
 }
 
-static void __exit mcswap_destroy_caches(void) {
+static void mcswap_destroy_caches(void) {
 	kmem_cache_destroy(mcswap_entry_cache);
 	kmem_cache_destroy(page_ack_req_cache);
 	kmem_cache_destroy(rdma_req_cache);
