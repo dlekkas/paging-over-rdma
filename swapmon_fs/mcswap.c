@@ -588,6 +588,11 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 	struct mcswap_entry* ent;
 	struct page_ack_req* req;
 	int i, ret;
+#ifdef DEBUG
+	pr_info("[%u] %s(swap_type = %u, offset = %lu)\n",
+				 atomic_read(&mcswap_stored_pages), __func__,
+				 swap_type, offset);
+#endif
 
 	ret = kmem_cache_alloc_bulk(mcswap_entry_cache, GFP_KERNEL,
 			ctrl->n_servers, (void *) &ent);
@@ -627,6 +632,7 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 				 atomic_read(&mcswap_stored_pages), __func__,
 				 swap_type, offset);
 				 */
+	atomic_inc(&mcswap_stored_pages);
 
 	return 0;
 }
@@ -639,12 +645,12 @@ static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 		return;
 	}
 	complete(&req->done);
-
 	ib_dma_unmap_page(ctrl->dev, req->dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
 }
 
 static int mcswap_rdma_read_sync(struct page *page,
 		struct mcswap_entry *ent, struct server_ctx *sctx) {
+	struct timespec ts_start, ts_now;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
 	const struct ib_send_wr *bad_wr;
 #else
@@ -693,10 +699,27 @@ static int mcswap_rdma_read_sync(struct page *page,
 
 	ret = ib_post_send(sctx->qp, &rdma_wr.wr, &bad_wr);
 	if (unlikely(ret)) {
-		pr_err("ib_post_send failed to read remote page\n");
+		pr_err("ib_post_send failed to post RR for page (error = %d)\n", ret);
 		return ret;
 	}
 
+	if (sctx->send_cq->poll_ctx == IB_POLL_DIRECT) {
+		getnstimeofday(&ts_start);
+		while (!try_wait_for_completion(&req->done)) {
+		  ib_process_cq_direct(sctx->send_cq, 1);
+			getnstimeofday(&ts_now);
+			if (ts_now.tv_sec - ts_start.tv_sec >= 1) {
+				return -ETIME;
+			}
+			cpu_relax();
+		}
+		return ret;
+	}
+
+	return -1;
+	// TODO(dimlek): we should think about what happens when
+	// we fail to read from the remote memory server
+	/*
 	if (sctx->send_cq->poll_ctx == IB_POLL_DIRECT) {
 		while (!try_wait_for_completion(&req->done)) {
 		  ib_process_cq_direct(sctx->send_cq, 16);
@@ -704,6 +727,7 @@ static int mcswap_rdma_read_sync(struct page *page,
 		}
 		return ret;
 	}
+	*/
 
 	wait_ret = wait_for_completion_interruptible_timeout(&req->done,
 			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
@@ -715,6 +739,7 @@ static int mcswap_rdma_read_sync(struct page *page,
 		return -ETIME;
 	}
 
+	kmem_cache_free(rdma_req_cache, req);
 	return ret;
 }
 
@@ -978,16 +1003,16 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
 	// specifies the number of Completion Queue Entries (CQEs) and represents the
 	// size of the CQ.
+	poll_ctx = enable_poll_mode ? IB_POLL_DIRECT : IB_POLL_SOFTIRQ;
 	ctx->send_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
-			comp_vector, IB_POLL_SOFTIRQ);
+			comp_vector, poll_ctx);
 	if (IS_ERR(ctx->send_cq)) {
 		ret = PTR_ERR(ctx->send_cq);
 		goto out_err;
 	}
 
-	poll_ctx = enable_poll_mode ? IB_POLL_DIRECT : IB_POLL_SOFTIRQ;
 	ctx->recv_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
-			comp_vector, poll_ctx);
+			comp_vector, IB_POLL_SOFTIRQ);
 	if (IS_ERR(ctx->recv_cq)) {
 		ret = PTR_ERR(ctx->recv_cq);
 		goto out_destroy_send_cq;
