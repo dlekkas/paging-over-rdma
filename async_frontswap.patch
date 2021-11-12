@@ -1,0 +1,264 @@
+diff --git a/include/linux/frontswap.h b/include/linux/frontswap.h
+index 011965c08..9835cedde 100644
+--- a/include/linux/frontswap.h
++++ b/include/linux/frontswap.h
+@@ -11,6 +11,8 @@ struct frontswap_ops {
+ 	void (*init)(unsigned); /* this swap type was just swapon'ed */
+ 	int (*store)(unsigned, pgoff_t, struct page *); /* store a page */
+ 	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
++	int (*load_async)(unsigned, pgoff_t, struct page *); /* load a page async */
++	int (*poll_load)(int);
+ 	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
+ 	void (*invalidate_area)(unsigned); /* swap type just swapoff'ed */
+ 	struct frontswap_ops *next; /* private pointer to next ops */
+@@ -27,6 +29,8 @@ extern bool __frontswap_test(struct swap_info_struct *, pgoff_t);
+ extern void __frontswap_init(unsigned type, unsigned long *map);
+ extern int __frontswap_store(struct page *page);
+ extern int __frontswap_load(struct page *page);
++extern int __frontswap_load_async(struct page *page);
++extern int __frontswap_poll_load(int cpu);
+ extern void __frontswap_invalidate_page(unsigned, pgoff_t);
+ extern void __frontswap_invalidate_area(unsigned);
+ 
+@@ -93,6 +97,22 @@ static inline int frontswap_load(struct page *page)
+ 	return -1;
+ }
+ 
++static inline int frontswap_load_async(struct page *page)
++{
++	if (frontswap_enabled())
++		return __frontswap_load_async(page);
++
++	return -1;
++}
++
++static inline int frontswap_poll_load(int cpu)
++{
++	if (frontswap_enabled())
++		return __frontswap_poll_load(cpu);
++
++	return -1;
++}
++
+ static inline void frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ {
+ 	if (frontswap_enabled())
+diff --git a/mm/frontswap.c b/mm/frontswap.c
+index fec8b5044..6fee02799 100644
+--- a/mm/frontswap.c
++++ b/mm/frontswap.c
+@@ -264,8 +264,8 @@ int __frontswap_store(struct page *page)
+ 	 */
+ 	if (__frontswap_test(sis, offset)) {
+ 		__frontswap_clear(sis, offset);
+-		for_each_frontswap_ops(ops)
+-			ops->invalidate_page(type, offset);
++		//for_each_frontswap_ops(ops)
++			//ops->invalidate_page(type, offset);
+ 	}
+ 
+ 	/* Try to store in each implementation, until one succeeds. */
+@@ -325,6 +325,53 @@ int __frontswap_load(struct page *page)
+ }
+ EXPORT_SYMBOL(__frontswap_load);
+ 
++int __frontswap_load_async(struct page *page)
++{
++	int ret = -1;
++	swp_entry_t entry = { .val = page_private(page), };
++	int type = swp_type(entry);
++	struct swap_info_struct *sis = swap_info[type];
++	pgoff_t offset = swp_offset(entry);
++	struct frontswap_ops *ops;
++
++	VM_BUG_ON(!frontswap_ops);
++	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON(sis == NULL);
++
++	if (!__frontswap_test(sis, offset))
++		return -1;
++
++	/* Try loading from each implementation, until one succeeds. */
++	for_each_frontswap_ops(ops) {
++		ret = ops->load_async(type, offset, page);
++		if (!ret) /* successful load */
++			break;
++	}
++	if (ret == 0) {
++		inc_frontswap_loads();
++		if (frontswap_tmem_exclusive_gets_enabled) {
++			SetPageDirty(page);
++			__frontswap_clear(sis, offset);
++		}
++	}
++	return ret;
++}
++EXPORT_SYMBOL(__frontswap_load_async);
++
++int __frontswap_poll_load(int cpu)
++{
++	struct frontswap_ops *ops;
++
++	VM_BUG_ON(!frontswap_ops);
++
++	for_each_frontswap_ops(ops)
++		return ops->poll_load(cpu);
++
++	BUG();
++	return -1;
++}
++EXPORT_SYMBOL(__frontswap_poll_load);
++
+ /*
+  * Invalidate any data from frontswap associated with the specified swaptype
+  * and offset so that a subsequent "get" will fail.
+@@ -332,7 +379,7 @@ EXPORT_SYMBOL(__frontswap_load);
+ void __frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ {
+ 	struct swap_info_struct *sis = swap_info[type];
+-	struct frontswap_ops *ops;
++	// struct frontswap_ops *ops;
+ 
+ 	VM_BUG_ON(!frontswap_ops);
+ 	VM_BUG_ON(sis == NULL);
+@@ -340,8 +387,8 @@ void __frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ 	if (!__frontswap_test(sis, offset))
+ 		return;
+ 
+-	for_each_frontswap_ops(ops)
+-		ops->invalidate_page(type, offset);
++	// for_each_frontswap_ops(ops)
++		// ops->invalidate_page(type, offset);
+ 	__frontswap_clear(sis, offset);
+ 	inc_frontswap_invalidates();
+ }
+diff --git a/mm/page_io.c b/mm/page_io.c
+index e93f1a4ca..2836d96ad 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -4,7 +4,7 @@
+  *
+  *  Copyright (C) 1991, 1992, 1993, 1994  Linus Torvalds
+  *
+- *  Swap reorganised 29.12.95, 
++ *  Swap reorganised 29.12.95,
+  *  Asynchronous swapping added 30.12.95. Stephen Tweedie
+  *  Removed race in async swapping. 14.4.1996. Bruno Haible
+  *  Add swap of shared pages through the page cache. 20.2.1998. Stephen Tweedie
+@@ -358,10 +358,15 @@ int swap_readpage(struct page *page, bool synchronous)
+ 	VM_BUG_ON_PAGE(!PageSwapCache(page) && !synchronous, page);
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	VM_BUG_ON_PAGE(PageUptodate(page), page);
+-	if (frontswap_load(page) == 0) {
+-		SetPageUptodate(page);
+-		unlock_page(page);
+-		goto out;
++
++	if (synchronous) {
++		if (frontswap_load(page) == 0) {
++			goto out;
++		}
++	} else {
++		if (frontswap_load_async(page) == 0) {
++			goto out;
++		}
+ 	}
+ 
+ 	if (sis->flags & SWP_FILE) {
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 39ae7cfad..6257a510d 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -21,6 +21,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/swap_slots.h>
+ #include <linux/huge_mm.h>
++#include <linux/frontswap.h>
+ 
+ #include <asm/pgtable.h>
+ 
+@@ -202,7 +203,7 @@ void __delete_from_swap_cache(struct page *page)
+  * @page: page we want to move to swap
+  *
+  * Allocate swap space for the page and add the page to the
+- * swap cache.  Caller needs to hold the page lock. 
++ * swap cache.  Caller needs to hold the page lock.
+  */
+ int add_to_swap(struct page *page)
+ {
+@@ -280,9 +281,9 @@ void delete_from_swap_cache(struct page *page)
+ 	page_ref_sub(page, hpage_nr_pages(page));
+ }
+ 
+-/* 
+- * If we are the only user, then try to free up the swap cache. 
+- * 
++/*
++ * If we are the only user, then try to free up the swap cache.
++ *
+  * Its ok to check for PageSwapCache without the page lock
+  * here because we are going to recheck again inside
+  * try_to_free_swap() _with_ the lock.
+@@ -296,7 +297,7 @@ static inline void free_swap_cache(struct page *page)
+ 	}
+ }
+ 
+-/* 
++/*
+  * Perform a free_page(), also freeing any swap cache associated with
+  * this page if it is the last user of the page.
+  */
+@@ -554,14 +555,19 @@ static unsigned long swapin_nr_pages(unsigned long offset)
+ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 			struct vm_area_struct *vma, unsigned long addr)
+ {
+-	struct page *page;
++	struct page *page, *faultpage;
+ 	unsigned long entry_offset = swp_offset(entry);
+ 	unsigned long offset = entry_offset;
+ 	unsigned long start_offset, end_offset;
+ 	unsigned long mask;
+ 	struct swap_info_struct *si = swp_swap_info(entry);
+-	struct blk_plug plug;
+ 	bool do_poll = true, page_allocated;
++	int cpu;
++
++	preempt_disable();
++	cpu = smp_processor_id();
++	faultpage = read_swap_cache_async(entry, gfp_mast, vma, addr, do_poll);
++	preempt_enable();
+ 
+ 	mask = swapin_nr_pages(offset) - 1;
+ 	if (!mask)
+@@ -576,14 +582,16 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 	if (end_offset >= si->max)
+ 		end_offset = si->max - 1;
+ 
+-	blk_start_plug(&plug);
+ 	for (offset = start_offset; offset <= end_offset ; offset++) {
++		if (offset == entry_offset)
++			continue;
+ 		/* Ok, do the async read-ahead now */
+ 		page = __read_swap_cache_async(
+ 			swp_entry(swp_type(entry), offset),
+ 			gfp_mask, vma, addr, &page_allocated);
+ 		if (!page)
+ 			continue;
++
+ 		if (page_allocated) {
+ 			swap_readpage(page, false);
+ 			if (offset != entry_offset &&
+@@ -594,11 +602,11 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 		}
+ 		put_page(page);
+ 	}
+-	blk_finish_plug(&plug);
+ 
+ 	lru_add_drain();	/* Push any new pages onto the LRU now */
+ skip:
+-	return read_swap_cache_async(entry, gfp_mask, vma, addr, do_poll);
++	frontswap_poll_load(cpu);
++	return faultpage;
+ }
+ 
+ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
