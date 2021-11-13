@@ -166,7 +166,7 @@ index e93f1a4ca..2836d96ad 100644
  
  	if (sis->flags & SWP_FILE) {
 diff --git a/mm/swap_state.c b/mm/swap_state.c
-index 39ae7cfad..6257a510d 100644
+index 39ae7cfad..c178219c3 100644
 --- a/mm/swap_state.c
 +++ b/mm/swap_state.c
 @@ -21,6 +21,7 @@
@@ -225,7 +225,7 @@ index 39ae7cfad..6257a510d 100644
 +
 +	preempt_disable();
 +	cpu = smp_processor_id();
-+	faultpage = read_swap_cache_async(entry, gfp_mast, vma, addr, do_poll);
++	faultpage = read_swap_cache_async(entry, gfp_mask, vma, addr, do_poll);
 +	preempt_enable();
  
  	mask = swapin_nr_pages(offset) - 1;

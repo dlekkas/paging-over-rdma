@@ -31,6 +31,7 @@
 #include <linux/inet.h>
 #include <linux/delay.h>
 #include <linux/version.h>
+#include <linux/pagemap.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
@@ -46,6 +47,7 @@
 #define MCSWAP_PAGE_ACK_TIMEOUT_MS 1
 
 #define MCSWAP_MCAST_JOIN_TIMEOUT_SEC 5
+#define MCSWAP_LOAD_PAGE_TIMEOUT_SEC 3
 #define MCSWAP_MAX_MCAST_CQE 12288
 
 #ifdef CONFIG_DEBUG_FS
@@ -129,6 +131,7 @@ static struct mcswap_tree *mcswap_trees[MAX_SWAPFILES];
 struct rdma_req {
 	struct ib_cqe cqe;
 	struct completion done;
+	struct page *page;
 	u64 dma;
 };
 
@@ -250,6 +253,7 @@ struct mcast_ctx {
 struct swapmon_rdma_ctrl {
 	struct ib_device *dev;
 	struct ib_pd *pd;
+	struct ib_cq *send_cq;
 
 	struct mcast_ctx mcast;
 	struct server_ctx *server;
@@ -263,6 +267,8 @@ struct swapmon_rdma_ctrl {
 
 	// Infiniband address
 	struct sockaddr_ib mcast_addr;
+
+	atomic_t inflight_loads;
 
 	int n_servers;
 };
@@ -588,6 +594,9 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 	struct mcswap_entry* ent;
 	struct page_ack_req* req;
 	int i, ret;
+	if (PageTransHuge(page)) {
+		return -EINVAL;
+	}
 #ifdef DEBUG
 	pr_info("[%u] %s(swap_type = %u, offset = %lu)\n",
 				 atomic_read(&mcswap_stored_pages), __func__,
@@ -627,13 +636,7 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 	if (unlikely(ret)) {
 		return ret;
 	}
-	/*
-	pr_info("[%u] %s(swap_type = %u, offset = %lu)\n",
-				 atomic_read(&mcswap_stored_pages), __func__,
-				 swap_type, offset);
-				 */
 	atomic_inc(&mcswap_stored_pages);
-
 	return 0;
 }
 
@@ -644,8 +647,20 @@ static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 					 ib_wc_status_msg(wc->status));
 		return;
 	}
-	complete(&req->done);
 	ib_dma_unmap_page(ctrl->dev, req->dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	atomic_dec(&ctrl->inflight_loads);
+	complete(&req->done);
+
+#ifdef ASYNC
+	if (!PageUptodate(req->page)) {
+		SetPageUptodate(req->page);
+		unlock_page(req->page);
+	}
+#endif
+
+	if (cq->poll_ctx == IB_POLL_DIRECT) {
+		kmem_cache_free(rdma_req_cache, req);
+	}
 }
 
 static int mcswap_rdma_read_sync(struct page *page,
@@ -685,6 +700,7 @@ static int mcswap_rdma_read_sync(struct page *page,
 	}
 	init_completion(&req->done);
 	req->cqe.done = page_read_done;
+	req->page = page;
 	req->dma = dma_addr;
 
 	rdma_wr.wr.wr_cqe = &req->cqe;
@@ -702,32 +718,22 @@ static int mcswap_rdma_read_sync(struct page *page,
 		pr_err("ib_post_send failed to post RR for page (error = %d)\n", ret);
 		return ret;
 	}
+	atomic_inc(&ctrl->inflight_loads);
 
-	if (sctx->send_cq->poll_ctx == IB_POLL_DIRECT) {
+	if (sctx->qp->send_cq->poll_ctx == IB_POLL_DIRECT) {
 		getnstimeofday(&ts_start);
-		while (!try_wait_for_completion(&req->done)) {
-		  ib_process_cq_direct(sctx->send_cq, 1);
+		while (atomic_read(&ctrl->inflight_loads) > 0) {
+		  ib_process_cq_direct(sctx->qp->send_cq, 1);
 			getnstimeofday(&ts_now);
-			if (ts_now.tv_sec - ts_start.tv_sec >= 1) {
+			if (ts_now.tv_sec - ts_start.tv_sec >=
+					MCSWAP_LOAD_PAGE_TIMEOUT_SEC) {
+				pr_err("timed out when reading page %lu\n", ent->offset);
 				return -ETIME;
 			}
 			cpu_relax();
 		}
 		return ret;
 	}
-
-	return -1;
-	// TODO(dimlek): we should think about what happens when
-	// we fail to read from the remote memory server
-	/*
-	if (sctx->send_cq->poll_ctx == IB_POLL_DIRECT) {
-		while (!try_wait_for_completion(&req->done)) {
-		  ib_process_cq_direct(sctx->send_cq, 16);
-			cpu_relax();
-		}
-		return ret;
-	}
-	*/
 
 	wait_ret = wait_for_completion_interruptible_timeout(&req->done,
 			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
@@ -767,16 +773,6 @@ static int __mcswap_load_sync(unsigned swap_type, pgoff_t offset,
 	}
 	spin_unlock_bh(&tree->lock);
 	sctx = &ctrl->server[entry->sidx];
-
-	/*
-	if (!PageReadahead(page)) {
-		ret = mcswap_rdma_read_sync(page, entry, sctx);
-	} else {
-		//ret = mcswap_rdma_read_async(page, entry, sctx);
-		ClearPageWaiters(page);
-		// TODO(dimlek): !!!!! insert a page waiter before unlocking page in mcswap_read_done
-	}
-	*/
 
 	ret = mcswap_rdma_read_sync(page, entry, sctx);
 	if (unlikely(ret)) {
@@ -856,6 +852,25 @@ static void mcswap_invalidate_area(unsigned swap_type) {
 	mcswap_trees[swap_type] = NULL;
 }
 
+static int mcswap_poll_load(int cpu) {
+	struct timespec ts_start, ts_now;
+	if (ctrl->send_cq->poll_ctx == IB_POLL_DIRECT) {
+		getnstimeofday(&ts_start);
+		while (atomic_read(&ctrl->inflight_loads) > 0) {
+		  ib_process_cq_direct(ctrl->send_cq, 8);
+			getnstimeofday(&ts_now);
+			if (ts_now.tv_sec - ts_start.tv_sec >=
+					MCSWAP_LOAD_PAGE_TIMEOUT_SEC + 5) {
+				pr_err("timed out when polling");
+				return -ETIME;
+			}
+			cpu_relax();
+		}
+	}
+
+	return 0;
+}
+
 static struct frontswap_ops mcswap_sync_ops = {
 	// prepares the device to receive frontswap pages associated with the
 	// specified swap device number (aka "type"). This function is invoked
@@ -877,6 +892,10 @@ static struct frontswap_ops mcswap_async_ops = {
 	.init = mcswap_fs_init,
 	.store = mcswap_store_async,
 	.load = mcswap_load_sync,
+#ifdef ASYNC
+	.load_async = mcswap_load_sync,
+	.poll_load = mcswap_poll_load,
+#endif
 	.invalidate_page = mcswap_invalidate_page,
 	.invalidate_area = mcswap_invalidate_area
 };
@@ -959,7 +978,7 @@ static int mcswap_rc_create_qp(struct server_ctx *ctx) {
 	init_attr.cap.max_send_sge = 1;
 	init_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	init_attr.qp_type = IB_QPT_RC;
-	init_attr.send_cq = ctx->send_cq;
+	init_attr.send_cq = ctrl->send_cq;
 	init_attr.recv_cq = ctx->recv_cq;
 
 	// allocate a queue pair (QP) and associate it with the specified
@@ -998,11 +1017,6 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 		goto out_err;
 	}
 
-	// Before creating the local QP, we must first cause the HCA to create the CQs
-	// to be associated with the SQ and RQ of the QP about to be created. The QP's
-	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
-	// specifies the number of Completion Queue Entries (CQEs) and represents the
-	// size of the CQ.
 	poll_ctx = enable_poll_mode ? IB_POLL_DIRECT : IB_POLL_SOFTIRQ;
 	ctx->send_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
 			comp_vector, poll_ctx);
@@ -1011,6 +1025,11 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 		goto out_err;
 	}
 
+	// Before creating the local QP, we must first cause the HCA to create the CQs
+	// to be associated with the SQ and RQ of the QP about to be created. The QP's
+	// SQ and RQ can have separate CQs or may share a CQ. The 3rd argument
+	// specifies the number of Completion Queue Entries (CQEs) and represents the
+	// size of the CQ.
 	ctx->recv_cq = ib_alloc_cq(ctrl->dev, ctx, 8096,
 			comp_vector, IB_POLL_SOFTIRQ);
 	if (IS_ERR(ctx->recv_cq)) {
@@ -1038,9 +1057,9 @@ static int mcswap_rdma_addr_resolved(struct rdma_cm_id *cm_id) {
 out_destroy_qp:
 	rdma_destroy_qp(ctx->cm_id);
 out_destroy_recv_cq:
-	ib_free_cq(ctx->send_cq);
-out_destroy_send_cq:
 	ib_free_cq(ctx->recv_cq);
+out_destroy_send_cq:
+	ib_free_cq(ctx->send_cq);
 out_err:
 	return ret;
 }
@@ -1065,7 +1084,7 @@ static int mcswap_rdma_route_resolved(struct server_ctx *ctx) {
   ret = rdma_connect(ctx->cm_id, &param);
   if (ret) {
     pr_err("rdma_connect failed: %d\n", ret);
-    ib_free_cq(ctx->send_cq);
+		ib_free_cq(ctx->send_cq);
     ib_free_cq(ctx->recv_cq);
 		return ret;
   }
@@ -1466,6 +1485,7 @@ static int mcswap_check_hca_support(struct ib_device *dev, u8 port_num) {
 }
 
 static int mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
+	int comp_vector = 0;
 	int ret;
 
 	mctx->cm_id = rdma_create_id(&init_net, mcswap_cm_event_handler,
@@ -1498,8 +1518,8 @@ static int mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
 		goto destroy_mcast_cm_id;
 	}
 
-	mctx->cq = ib_alloc_cq(ctrl->dev, ctrl,
-			MCSWAP_MAX_MCAST_CQE, 0, IB_POLL_SOFTIRQ);
+	mctx->cq = ib_alloc_cq(ctrl->dev, ctrl, MCSWAP_MAX_MCAST_CQE,
+			comp_vector, IB_POLL_SOFTIRQ);
 	if (IS_ERR(mctx->cq)) {
 		pr_err("failed to alloc completion queue\n");
 		ret = PTR_ERR(mctx->cq);
@@ -1557,6 +1577,7 @@ static int __init mcswap_alloc_ctrl_resources(void) {
 		pr_err("failed to alloc memory for ctrl structure\n");
 		goto exit;
 	}
+	atomic_set(&ctrl->inflight_loads, 0);
 
 	ctrl->server = kzalloc(sizeof *ctrl->server * nr_servers, GFP_KERNEL);
 	if (!ctrl->server) {
@@ -1709,6 +1730,8 @@ static int __init mcswap_parse_module_params(void) {
 }
 
 static int __init mcswap_init(void) {
+	enum ib_poll_context poll_ctx;
+	int comp_vector = 0;
 	int ret, i;
 	ret = mcswap_alloc_ctrl_resources();
 	if (ret) {
@@ -1726,10 +1749,24 @@ static int __init mcswap_init(void) {
 		goto destroy_caches;
 	}
 
+	if (!ctrl->dev) {
+		return -ENODEV;
+	}
+
+	// since we already have a handle here on the HCA, we can create the
+	// shared send completion queue for all the RCs to the mem servers
+	poll_ctx = enable_poll_mode ? IB_POLL_DIRECT : IB_POLL_SOFTIRQ;
+	ctrl->send_cq = ib_alloc_cq(ctrl->dev, ctrl, 8096,
+			comp_vector, poll_ctx);
+	if (IS_ERR(ctrl->send_cq)) {
+		ret = PTR_ERR(ctrl->send_cq);
+		goto destroy_mcast_resources;
+	}
+
 	for (i = 0; i < ctrl->n_servers; i++) {
 		ret = mcswap_server_connect(&ctrl->server[i]);
 		if (ret)
-			goto destroy_mcast_resources;
+			goto destroy_send_cq;
 	}
 
 	if (enable_async_mode) {
@@ -1746,6 +1783,8 @@ static int __init mcswap_init(void) {
 	pr_info("module loaded successfully.\n");
 	return 0;
 
+destroy_send_cq:
+	ib_free_cq(ctrl->send_cq);
 destroy_mcast_resources:
 	mcswap_destroy_mcast_resources();
 destroy_caches:
