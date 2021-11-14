@@ -5,6 +5,7 @@
 #include <vector>
 #include <chrono>
 #include <string>
+#include <assert.h>
 
 // computation that invokes swapping activity
 int dummy_computation(std::vector<int>& v) {
@@ -29,5 +30,9 @@ int main(int argc, char** argv) {
 	auto t2 = std::chrono::high_resolution_clock::now();
 	auto elapsed_ms = std::chrono::duration_cast<
 		std::chrono::milliseconds>(t2 - t1).count();
+
+	for (size_t i = 0; i < vec.size(); i+=4096) {
+		assert(vec[i] == i / 4096);
+	}
 	std::cout << elapsed_ms << std::endl;
 }
