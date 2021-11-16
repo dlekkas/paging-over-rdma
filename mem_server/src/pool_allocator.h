@@ -1,11 +1,17 @@
 #include <stdlib.h>
 #include <iostream>
+#include <functional>
+#include <optional>
+#include <utility>
 #include <cstdlib>
+#include <cerrno>
 #include <chrono>
 #include <unordered_map>
+#include <infiniband/verbs.h>
 
 #include <cstddef>
 
+static int global_cnt = 0;
 
 struct Chunk {
 	Chunk *next;
@@ -20,17 +26,19 @@ struct Chunk {
 template <std::size_t NC, std::size_t S = 4096>
 class FixedChunkAllocator {
  public:
-	explicit FixedChunkAllocator(bool prealloc);
+	FixedChunkAllocator(struct ibv_pd* pd, bool prealloc);
 
 	~FixedChunkAllocator();
 
-	void* ChunkAlloc();
+	std::pair<void*,int> ChunkAlloc();
 
 	void BufRelease(void* buf);
 	void ChunkRelease(void* chunk);
 
 	uint64_t ChunkResolve(void* buf);
+	uint64_t BlockResolve(void* buf);
 
+	std::unordered_map<uint64_t, uint64_t> mr_map;
 	std::unordered_map<uint64_t, uint64_t> remap;
 
  private:
@@ -40,7 +48,11 @@ class FixedChunkAllocator {
 
 	constexpr static std::size_t batch_sz_ = n_batches_ * S;
 
-	int resolve_shift_bits;
+	int chunk_resolve_shift_bits_;
+	int block_resolve_shift_bits_;
+
+	struct ibv_pd* pd_;
+	struct ibv_mr* mr_;
 
 	// Pointer to the first chunk in the free list.
 	Chunk* alloc_ptr_ = nullptr;
@@ -48,11 +60,15 @@ class FixedChunkAllocator {
 	// Should not be invoked if free chunks are available
 	// (i.e. alloc_ptr_ != nullptr).
 	Chunk* alloc_block_();
+
 };
 
 template <std::size_t NC, std::size_t S>
-FixedChunkAllocator<NC, S>::FixedChunkAllocator(bool prealloc) {
-	resolve_shift_bits = __builtin_ctz(batch_sz_);
+FixedChunkAllocator<NC, S>::FixedChunkAllocator(struct ibv_pd* pd,
+		bool prealloc) {
+	chunk_resolve_shift_bits_ = __builtin_ctz(batch_sz_);
+	block_resolve_shift_bits_ = __builtin_ctz(block_sz_);
+	pd_ = pd;
 	if (prealloc) {
 		alloc_ptr_ = alloc_block_();
 	}
@@ -66,14 +82,18 @@ FixedChunkAllocator<NC, S>::~FixedChunkAllocator() {
 
 template<std::size_t NC, std::size_t S>
 uint64_t FixedChunkAllocator<NC, S>::ChunkResolve(void* buf) {
-	return (uint64_t) buf >> resolve_shift_bits;
+	return (uint64_t) buf >> chunk_resolve_shift_bits_;
+}
+
+template<std::size_t NC, std::size_t S>
+uint64_t FixedChunkAllocator<NC, S>::BlockResolve(void* buf) {
+	return (uint64_t) buf >> block_resolve_shift_bits_;
 }
 
 template <std::size_t NC, std::size_t S>
 Chunk* FixedChunkAllocator<NC, S>::alloc_block_() {
-	//TODO(dimlek): find out why aligned alloc fails
-	void* buf = std::aligned_alloc(batch_sz_, block_sz_);
-	//void* buf = malloc(block_sz_);
+	global_cnt++;
+	void* buf = std::aligned_alloc(block_sz_, block_sz_);
 	if (buf == nullptr) {
 		std::cerr << "Failed to allocate " << block_sz_ << " bytes.\n";
 		return nullptr;
@@ -81,20 +101,30 @@ Chunk* FixedChunkAllocator<NC, S>::alloc_block_() {
 	Chunk* head_chunk = reinterpret_cast<Chunk*>(buf);
 
 	Chunk* iter = head_chunk;
-	for (std::size_t i = 0; i < NC-1; i++) {
-		if (i % n_batches_ == 0) {
-			iter->next = reinterpret_cast<Chunk*>((uint64_t) iter + batch_sz_);
-			iter = iter->next;
-			//remap[ChunkResolve(iter)] = 0;
-		}
+
+	int n_iters = NC / n_batches_;
+	for (std::size_t i = 0; i < n_iters-1; i++) {
+		iter->next = reinterpret_cast<Chunk*>((uint64_t) iter + batch_sz_);
+		iter = iter->next;
+		remap[ChunkResolve(iter)] = 0;
+		mr_map[BlockResolve(iter)] = global_cnt;
 	}
 	iter->next = nullptr;
+
+	/*
+	mr_ = ibv_reg_mr(pd_, buf, block_sz_, IBV_ACCESS_LOCAL_WRITE |
+			IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+	if (!mr_) {
+		std::cerr << "ibv_reg_mr failed: " << std::strerror(errno) << "\n";
+		return nullptr;
+	}
+	*/
 
 	return head_chunk;
 }
 
 template <std::size_t NC, std::size_t S>
-void* FixedChunkAllocator<NC, S>::ChunkAlloc() {
+std::pair<void*,int> FixedChunkAllocator<NC, S>::ChunkAlloc() {
 	// if we don't have chunks available, then we allocate a new block
 	if (alloc_ptr_ == nullptr) {
 		alloc_ptr_ = alloc_block_();
@@ -104,7 +134,7 @@ void* FixedChunkAllocator<NC, S>::ChunkAlloc() {
 	Chunk *res = alloc_ptr_;
 	alloc_ptr_ = alloc_ptr_->next;
 
-	return res;
+	return std::make_pair(res, mr_map[BlockResolve(res)]);
 }
 
 template <std::size_t NC, std::size_t S>
@@ -121,4 +151,3 @@ void FixedChunkAllocator<NC, S>::ChunkRelease(void* chunk) {
 	curr->next = alloc_ptr_;
 	alloc_ptr_ = reinterpret_cast<Chunk*>(chunk);
 }
-
