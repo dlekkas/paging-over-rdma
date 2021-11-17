@@ -20,17 +20,16 @@ def main(results_dir):
         latency_df['system'] = str(os.path.basename(f.parent))
         agg_df = pd.concat([agg_df, latency_df])
 
-    agg_df['norm_runtime'] = agg_df.apply(
-            lambda x: x['latency'] / agg_df.loc[(agg_df.system=='noswap') &
-                (agg_df.memory==x['memory']), 'latency'].values[0], axis=1)
-    agg_df['rmem_ratio'] = (agg_df.memory - 280) / agg_df.memory
+    agg_df['speedup'] = agg_df.apply(
+            lambda x: agg_df.loc[(agg_df.system=='diskswap') & (agg_df.memory==x['memory']),
+                'latency'].values[0] / x['latency'], axis=1)
+    agg_df['rmem_ratio'] = (agg_df.memory / 300) - 1
     agg_df['rmem_ratio'] = agg_df['rmem_ratio'].apply(lambda x: "{0:.2f}%".format(x*100))
 
     agg_df.reset_index(drop=True, inplace=True)
-    ax = sns.lineplot(data=agg_df, x='rmem_ratio', y='norm_runtime', hue='system',
+    ax = sns.lineplot(data=agg_df, x='rmem_ratio', y='speedup', hue='system',
             style='system', markers=True, dashes=False)
-    ax.set(xlabel='Remote memory fraction', ylabel='Normalized runtime',
-           title='Dummy application execution time comparison')
+    ax.set(xlabel='Excess Memory Ratio', ylabel='Speedup')
     ax.get_figure().savefig('app_runtime_plot.pdf')
 
 
