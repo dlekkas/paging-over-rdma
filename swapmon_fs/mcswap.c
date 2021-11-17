@@ -720,6 +720,12 @@ static int mcswap_rdma_read_sync(struct page *page,
 	}
 	atomic_inc(&ctrl->inflight_loads);
 
+	/*
+#ifdef ASYNC
+	return 0;
+#endif
+*/
+
 	if (sctx->qp->send_cq->poll_ctx == IB_POLL_DIRECT) {
 		getnstimeofday(&ts_start);
 		while (atomic_read(&ctrl->inflight_loads) > 0) {
@@ -778,7 +784,7 @@ static int __mcswap_load_sync(unsigned swap_type, pgoff_t offset,
 	if (unlikely(ret)) {
 		pr_info("failed to fetch remote page %lu from server %s:%d\n",
 				offset, sctx->ip, sctx->port);
-		return -1;
+		return ret;
 	}
 
 #ifdef DEBUG
@@ -852,12 +858,14 @@ static void mcswap_invalidate_area(unsigned swap_type) {
 	mcswap_trees[swap_type] = NULL;
 }
 
+#ifdef ASYNC
 static int mcswap_poll_load(int cpu) {
+	return 0;
 	struct timespec ts_start, ts_now;
 	if (ctrl->send_cq->poll_ctx == IB_POLL_DIRECT) {
 		getnstimeofday(&ts_start);
 		while (atomic_read(&ctrl->inflight_loads) > 0) {
-		  ib_process_cq_direct(ctrl->send_cq, 8);
+		  ib_process_cq_direct(ctrl->send_cq, 1);
 			getnstimeofday(&ts_now);
 			if (ts_now.tv_sec - ts_start.tv_sec >=
 					MCSWAP_LOAD_PAGE_TIMEOUT_SEC + 5) {
@@ -866,10 +874,13 @@ static int mcswap_poll_load(int cpu) {
 			}
 			cpu_relax();
 		}
+	} else {
+		pr_err("something is wrong");
 	}
 
 	return 0;
 }
+#endif
 
 static struct frontswap_ops mcswap_sync_ops = {
 	// prepares the device to receive frontswap pages associated with the
@@ -1111,17 +1122,12 @@ static int str_to_ib_sockaddr(char *dst, struct sockaddr_ib *mcast_addr) {
 static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 		struct mcast_ctx *mc_ctx) {
 	struct rdma_ud_param *param = &event->param.ud;
-	const struct ib_global_route *grh = rdma_ah_read_grh(&param->ah_attr);
-
-	if (param->ah_attr.type != RDMA_AH_ATTR_TYPE_IB) {
-		pr_err("only IB address handle type is supported\n");
-		return -ENOTSUPP;
-	}
+	const struct ib_global_route *grh = &param->ah_attr.grh;
 
 	pr_info("IB multicast group info: dgid = %16phC, mlid = 0x%x, "
 			"sl = %d, src_path_bits = %u, qpn = %u, qkey = %u\n",
-			param->ah_attr.grh.dgid.raw, param->ah_attr.ib.dlid,
-			rdma_ah_get_sl(&param->ah_attr), rdma_ah_get_path_bits(&param->ah_attr),
+			param->ah_attr.grh.dgid.raw, param->ah_attr.dlid,
+			param->ah_attr.sl, param->ah_attr.src_path_bits,
 			param->qp_num, param->qkey);
 
 	mc_ctx->ri = kzalloc(sizeof *mc_ctx->ri , GFP_KERNEL);
@@ -1131,7 +1137,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 	}
 
 	memcpy(mc_ctx->ri->gid_raw, grh->dgid.raw, sizeof grh->dgid);
-	mc_ctx->ri->lid  = rdma_ah_get_dlid(&param->ah_attr);
+	mc_ctx->ri->lid  = param->ah_attr.dlid;
 	mc_ctx->ri->qkey = param->qkey;
 
 	mc_ctx->qpn  = param->qp_num;
@@ -1141,7 +1147,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr,
 			RDMA_CREATE_AH_SLEEPABLE);
 #else
-	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr);
+	mc_ctx->ah = ib_create_ah(ctrl->pd, &param->ah_attr);
 #endif
 	if (!mc_ctx->ah) {
 		pr_err("failed to create address handle for multicast\n");
@@ -1555,7 +1561,7 @@ destroy_mcast_ah:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 	rdma_destroy_ah(mctx->ah, RDMA_DESTROY_AH_SLEEPABLE);
 #else
-	rdma_destroy_ah(mctx->ah);
+	ib_destroy_ah(mctx->ah);
 #endif
 leave_mcast_grp:
 	rdma_leave_multicast(mctx->cm_id,
