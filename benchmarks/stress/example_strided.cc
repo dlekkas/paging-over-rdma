@@ -18,11 +18,11 @@ int dummy_computation(std::vector<int>& v) {
 
 int main(int argc, char** argv) {
 	if (argc != 2) {
-		std::cerr << "Usage: " << argv[0] << " <num>\n";
+		std::cerr << "Usage: " << argv[0] << " <mbs>\n";
 		std::exit(1);
 	}
 	int val = std::stoi(argv[1]);
-	int ws_sz = val * 1024 * 4096;
+	int ws_sz = val * 256 * 1024;
 	std::vector<int> vec(ws_sz);
 
 	auto t1 = std::chrono::high_resolution_clock::now();
