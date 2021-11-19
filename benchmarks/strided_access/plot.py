@@ -7,6 +7,8 @@ import pandas as pd
 import argparse
 import os
 
+CGROUP_MEM_MBS = 300
+
 sns.set(style='whitegrid')
 sns.set_palette(sns.color_palette('bright'))
 
@@ -23,7 +25,7 @@ def main(results_dir):
     agg_df['speedup'] = agg_df.apply(
             lambda x: agg_df.loc[(agg_df.system=='diskswap') & (agg_df.memory==x['memory']),
                 'latency'].values[0] / x['latency'], axis=1)
-    agg_df['rmem_ratio'] = (agg_df.memory / 300) - 1
+    agg_df['rmem_ratio'] = (agg_df.memory / CGROUP_MEM_MBS) - 1
     agg_df['rmem_ratio'] = agg_df['rmem_ratio'].apply(lambda x: "{0:.2f}%".format(x*100))
 
     agg_df.reset_index(drop=True, inplace=True)

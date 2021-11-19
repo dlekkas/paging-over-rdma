@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
 		std::chrono::milliseconds>(t2 - t1).count();
 
 	for (size_t i = 0; i < vec.size(); i+=4096) {
-		assert(vec[i] == i / 4096);
+		assert((size_t) vec[i] == i / 4096);
 	}
 	std::cout << elapsed_ms << std::endl;
 }
