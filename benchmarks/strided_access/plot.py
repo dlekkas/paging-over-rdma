@@ -26,9 +26,10 @@ def main(results_dir):
             lambda x: agg_df.loc[(agg_df.system=='diskswap') & (agg_df.memory==x['memory']),
                 'latency'].values[0] / x['latency'], axis=1)
     agg_df['rmem_ratio'] = (agg_df.memory / CGROUP_MEM_MBS) - 1
-    agg_df['rmem_ratio'] = agg_df['rmem_ratio'].apply(lambda x: "{0:.2f}%".format(x*100))
+    agg_df['rmem_ratio'] = agg_df['rmem_ratio'].apply(lambda x: "{0:.0f}%".format(x*100))
 
     agg_df.reset_index(drop=True, inplace=True)
+    print(agg_df)
     ax = sns.lineplot(data=agg_df, x='rmem_ratio', y='speedup', hue='system',
             style='system', markers=True, dashes=False)
     ax.set(xlabel='Excess Memory Ratio', ylabel='Speedup')
