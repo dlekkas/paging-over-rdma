@@ -1,18 +1,12 @@
 #!/bin/bash
 
 SWAP_PARTITION=/dev/nvme0n1p3
-CLIENT_IB_IF='ib0'
 
 SERVER_IP='192.168.1.20'
+CLIENT_IP='192.168.1.10'
 SERVER_PORT=10000
 
 RESULTS_DIR=./results
-
-CLIENT_IP=`ip -o -4 addr list ${CLIENT_IB_IF} | awk '{print $4}' | cut -d/ -f1`
-if [ -z "$CLIENT_IP" ]; then
-	echo "Could not extract IP address from interface ${CLIENT_IB_IF}"
-	exit 1
-fi
 
 # check whether swapping is enabled and if not then enable
 # the swap partition appropriately.

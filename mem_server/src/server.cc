@@ -41,7 +41,8 @@
 #define BATCH_SZ 64
 
 // Memory size allocated for remote peers.
-constexpr std::size_t BUFFER_SIZE(120 * 4096 * REMOTE_PAGE_SZ);
+// constexpr std::size_t BUFFER_SIZE(120 * 4096 * REMOTE_PAGE_SZ);
+constexpr std::size_t BUFFER_SIZE(__UINT32_MAX__ - REMOTE_PAGE_SZ + 1);
 
 // Completion Queue (CQ) will contain at least `MIN_CQE` entries.
 constexpr int MIN_CQE(8192);
@@ -1101,6 +1102,6 @@ int main(int argc, char *argv[]) {
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
 	std::cout << "Polling for 5 min ..." << std::endl;
-	server.Poll(120);
+	server.Poll(300);
 	return 0;
 }

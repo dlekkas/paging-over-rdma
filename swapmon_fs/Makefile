@@ -1,4 +1,4 @@
-EXTRA_CFLAGS += -D_GNU_SOURCE -DBENCH
+EXTRA_CFLAGS += -D_GNU_SOURCE
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 obj-m := mcswap.o

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
+#include <thread>
 #include <string>
 #include <assert.h>
 
@@ -27,8 +28,11 @@ int main(int argc, char** argv) {
 	int ws_sz = val * 256 * 1024;
 	std::vector<int> vec(ws_sz);
 
+	using namespace std::chrono_literals;
+	std::this_thread::sleep_for(20s);
+
 	auto t1 = std::chrono::high_resolution_clock::now();
-	dummy_computation(vec, 5);
+	dummy_computation(vec, 1);
 	auto t2 = std::chrono::high_resolution_clock::now();
 	auto elapsed_ms = std::chrono::duration_cast<
 		std::chrono::milliseconds>(t2 - t1).count();
