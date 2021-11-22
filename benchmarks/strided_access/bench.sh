@@ -6,7 +6,7 @@ CLIENT_IP='192.168.1.10'
 SERVER_PORT=10000
 
 FASTSWAP_ROOT_DIR=$HOME/fastswap
-MCSWAP_ROOT_DIR=$HOME/mcswap
+MCSWAP_ROOT_DIR=$HOME/paging-over-rdma
 RESULTS_DIR=./results
 
 n_reps=5
@@ -67,7 +67,6 @@ elif [ "$system" != "diskswap" ]; then
 	echo "Usage: ./bench.sh [mcswap|fastswap|diskswap]"
 	exit 1
 fi
-
 
 res_dir=${RESULTS_DIR}/${system}
 mkdir -p ${res_dir}

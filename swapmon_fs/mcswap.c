@@ -1099,7 +1099,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 		struct mcast_ctx *mc_ctx) {
 	struct rdma_ud_param *param = &event->param.ud;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,16,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 	const struct ib_global_route *grh = rdma_ah_read_grh(&param->ah_attr);
 	pr_info("IB multicast group info: dgid = %16phC, mlid = 0x%x, "
 			"sl = %d, src_path_bits = %u, qpn = %u, qkey = %u\n",
@@ -1117,7 +1117,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 	}
 
 	memcpy(mc_ctx->ri->gid_raw, grh->dgid.raw, sizeof grh->dgid);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,16,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 	mc_ctx->ri->lid  = rdma_ah_get_dlid(&param->ah_attr);
 #else
 	mc_ctx->ri->lid = param->ah_attr.dlid;
@@ -1130,7 +1130,7 @@ static int mcswap_mcast_join_handler(struct rdma_cm_event *event,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
 	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr,
 			RDMA_CREATE_AH_SLEEPABLE);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,16,0)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 	mc_ctx->ah = rdma_create_ah(ctrl->pd, &param->ah_attr);
 #else
 	mc_ctx->ah = ib_create_ah(ctrl->pd, &param->ah_attr);
@@ -1546,7 +1546,7 @@ static int mcswap_rdma_mcast_init(struct mcast_ctx *mctx) {
 destroy_mcast_ah:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 	rdma_destroy_ah(mctx->ah, RDMA_DESTROY_AH_SLEEPABLE);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
 	rdma_destroy_ah(mctx->ah);
 #else
 	ib_destroy_ah(mctx->ah);
