@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <fstream>
+#include <queue>
 
 #include "pool_allocator.h"
 
@@ -33,16 +34,19 @@
 /* ************************** */
 
 
-
 #define MAX_QUEUED_CONNECT_REQUESTS 2
 #define UD_QKEY 0x11111111
 #define IBV_DEFAULT_PKEY_FULL 0xFFFF
+#define ONE_GB 1024 * 1024 * 1024
 
 #define BATCH_SZ 64
 
 // Memory size allocated for remote peers.
 // constexpr std::size_t BUFFER_SIZE(120 * 4096 * REMOTE_PAGE_SZ);
-constexpr std::size_t BUFFER_SIZE(__UINT32_MAX__ - REMOTE_PAGE_SZ + 1);
+constexpr std::size_t BUFFER_SIZE(12ULL * ONE_GB);
+
+std::queue<uint64_t> free_list;
+bool second_phase = false;
 
 // Completion Queue (CQ) will contain at least `MIN_CQE` entries.
 constexpr int MIN_CQE(8192);
@@ -838,8 +842,20 @@ int ServerRDMA::post_page_recv_requests_fast(struct ibv_qp* qp,
 		for (int j = 0; j < blk_sz; j++) {
 			uint64_t page_idx =  (curr_idx_ + (i * blk_sz + j)) %
 					(BUFFER_SIZE / REMOTE_PAGE_SZ);
-			uint64_t page_addr = reinterpret_cast<uint64_t>(buf_) +
-					page_idx * REMOTE_PAGE_SZ;
+			if (page_idx == (BUFFER_SIZE / REMOTE_PAGE_SZ) - 1) {
+				std::cout << "Second phase initiated\n";
+				std::cout << "queue size = " << free_list.size() << "\n";;
+				second_phase = true;
+			}
+
+			uint64_t page_addr;
+			if (second_phase && !free_list.empty()) {
+				page_addr = free_list.front();
+				free_list.pop();
+			} else {
+				page_addr = reinterpret_cast<uint64_t>(buf_) +
+						page_idx * REMOTE_PAGE_SZ;
+			}
 			wr[j].wr_id = page_addr;
 			sge[2*j + 1].addr = page_addr;
 			sge[2*j + 1].length = REMOTE_PAGE_SZ;
@@ -894,8 +910,7 @@ void ServerRDMA::send_ack(uint32_t page_id, uint64_t addr, uint32_t rkey) {
 
 int ServerRDMA::Poll(int timeout_s) {
 	std::vector<double> times;
-	std::unordered_map<uint32_t, std::chrono::time_point<
-		std::chrono::high_resolution_clock>> pg_times_map;
+	std::unordered_map<uint32_t, uint64_t> pg_map;
 
 	struct ibv_device_attr dev_attr;
 	if (ibv_query_device(pd_->context, &dev_attr)) {
@@ -943,15 +958,19 @@ int ServerRDMA::Poll(int timeout_s) {
 			}
 			if (wc[i].status == IBV_WC_SUCCESS) {
 				uint64_t page_store_addr = wc[i].wr_id;
-				uint32_t page_id = ntohl(wc[i].imm_data);
 				// uint32_t rkey = allocator_.RkeyFind((void*) page_store_addr);
 				uint32_t rkey = mr_->rkey;
 				if (wc[i].wc_flags & IBV_WC_WITH_IMM) {
+					uint32_t page_id = ntohl(wc[i].imm_data);
 					n_posted_recvs_--;
 					n_recv_pages++;
-					auto t1 = std::chrono::high_resolution_clock::now();
+					// std::cout << "offset = " << page_id << " stored at "
+							// << page_store_addr << "\n";
 					send_ack(page_id, page_store_addr, rkey);
-					pg_times_map.insert({page_id, t1});
+					if (pg_map.find(page_id) != pg_map.end()) {
+						free_list.push(pg_map[page_id]);
+					}
+					pg_map[page_id] = page_store_addr;
 				}
 			} else {
 				std::cerr << "Polling failed with status "
@@ -971,11 +990,6 @@ int ServerRDMA::Poll(int timeout_s) {
 			if (wc[i].status != IBV_WC_SUCCESS) {
 				std::cerr << "ACK message failure.\n";
 			} else {
-				auto t1 = pg_times_map.find(wc[i].wr_id);
-				auto t2 = std::chrono::high_resolution_clock::now();
-				auto elapsed_us = std::chrono::duration_cast<
-					std::chrono::nanoseconds>(t2 - (t1->second));
-				times.push_back(elapsed_us.count() / 1000.0);
 				n_sent_acks++;
 			}
 		}
@@ -986,20 +1000,6 @@ int ServerRDMA::Poll(int timeout_s) {
 			curr_idx_ += succ_posts;
 		}
 	}
-
-	auto total = std::accumulate(times.begin(), times.end(), 0);
-	auto avg = (1.0 * total) / times.size();
-	auto min_val = *std::min_element(times.begin(), times.end());
-	auto max_val = *std::max_element(times.begin(), times.end());
-
-	std::cout << "Num ACK sent: " << n_sent_acks << std::endl;
-	std::cout << "Num pages received: " << n_recv_pages << std::endl;
-	std::cout << "Avg ACK time: " << avg << "[us]" << std::endl;
-	std::cout << "Min ACK time: " << min_val << std::endl;
-	std::cout << "Max ACK time: " << max_val << std::endl;
-
-	std::ofstream outf{"times.txt"};
-	for (const auto &e: times) { outf << e << "\n"; }
 
 	return 0;
 }
@@ -1101,7 +1101,7 @@ int main(int argc, char *argv[]) {
 	int connected_clients = server.WaitForClients(1);
 	std::cout << "Num of clients connected: " << connected_clients << std::endl;
 
-	std::cout << "Polling for 5 min ..." << std::endl;
-	server.Poll(300);
+	std::cout << "Polling for 1 hour..." << std::endl;
+	server.Poll(3600);
 	return 0;
 }
