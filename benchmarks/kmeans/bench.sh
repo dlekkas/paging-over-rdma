@@ -66,7 +66,7 @@ res_dir=${RESULTS_DIR}/${system}
 mkdir -p ${res_dir}
 
 res_file=${res_dir}/kmeans_times.csv
-for n_mbs in $( seq 120 60 240 ); do
+for n_mbs in $( seq 180 30 270 ); do
 	CGROUP_MEM_BYTES=$((n_mbs*1024*1024))
 	echo ${CGROUP_MEM_BYTES} > /sys/fs/cgroup/memory/${CGROUP_NAME}/memory.limit_in_bytes
 	sleep 3
