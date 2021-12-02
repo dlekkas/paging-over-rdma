@@ -130,7 +130,6 @@ static struct mcswap_tree *mcswap_trees[MAX_SWAPFILES];
 
 struct rdma_req {
 	struct ib_cqe cqe;
-	struct completion done;
 	struct page *page;
 	u64 dma;
 };
@@ -325,7 +324,7 @@ static int mcswap_mcast_send_page(struct page *page, pgoff_t offset) {
 
 	ud_wr.wr.next = NULL;
 	ud_wr.wr.wr_cqe = (struct ib_cqe *)
-		kzalloc(sizeof(struct ib_cqe), GFP_KERNEL);
+		kzalloc(sizeof(struct ib_cqe), GFP_ATOMIC);
 	if (!ud_wr.wr.wr_cqe) {
 		pr_err("kzalloc() failed to allocate memory for ib_cqe.\n");
 		return -ENOMEM;
@@ -604,7 +603,7 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 				 swap_type, offset);
 #endif
 
-	ret = kmem_cache_alloc_bulk(mcswap_entry_cache, GFP_KERNEL,
+	ret = kmem_cache_alloc_bulk(mcswap_entry_cache, GFP_ATOMIC,
 			ctrl->n_servers, (void *) &ent);
 	if (unlikely(ret != ctrl->n_servers)) {
 		pr_err("kmem_cache_alloc_bulk failed: %d\n", ret);
@@ -616,7 +615,7 @@ static int mcswap_store_async(unsigned swap_type, pgoff_t offset,
 		ent[i].sidx = i;
 	}
 
-	ret = kmem_cache_alloc_bulk(page_ack_req_cache, GFP_KERNEL,
+	ret = kmem_cache_alloc_bulk(page_ack_req_cache, GFP_ATOMIC,
 			ctrl->n_servers, (void *) &req);
 	if (unlikely(ret != ctrl->n_servers)) {
 		pr_err("kmem_cache_alloc_bulk failed: %d\n", ret);
@@ -651,11 +650,7 @@ static void page_read_done(struct ib_cq *cq, struct ib_wc *wc) {
 	}
 	ib_dma_unmap_page(ctrl->dev, req->dma, PAGE_SIZE, DMA_BIDIRECTIONAL);
 	atomic_dec(&ctrl->inflight_loads);
-	complete(&req->done);
-
-	if (cq->poll_ctx == IB_POLL_DIRECT) {
-		kmem_cache_free(rdma_req_cache, req);
-	}
+	kmem_cache_free(rdma_req_cache, req);
 }
 
 static int mcswap_rdma_read_sync(struct page *page,
@@ -670,7 +665,6 @@ static int mcswap_rdma_read_sync(struct page *page,
 	struct rdma_req *req;
 	struct ib_sge sge;
 	u64 dma_addr;
-	long wait_ret = 0;
 	int ret = 0;
 
   dma_addr = ib_dma_map_page(ctrl->dev, page, 0,
@@ -688,12 +682,11 @@ static int mcswap_rdma_read_sync(struct page *page,
 	sge.length = PAGE_SIZE;
 	sge.lkey = ctrl->pd->local_dma_lkey;
 
-	req = kmem_cache_alloc(rdma_req_cache, GFP_KERNEL);
+	req = kmem_cache_alloc(rdma_req_cache, GFP_ATOMIC);
 	if (unlikely(!req)) {
 		pr_err("slab allocator failed to allocate mem for rdma_req.\n");
 		return -ENOMEM;
 	}
-	init_completion(&req->done);
 	req->cqe.done = page_read_done;
 	req->page = page;
 	req->dma = dma_addr;
@@ -730,17 +723,6 @@ static int mcswap_rdma_read_sync(struct page *page,
 		return ret;
 	}
 
-	wait_ret = wait_for_completion_interruptible_timeout(&req->done,
-			msecs_to_jiffies(MCSWAP_PAGE_ACK_TIMEOUT_MS) + 1);
-	if (unlikely(wait_ret == -ERESTARTSYS)) {
-		pr_err("interrupted on ack waiting.\n");
-		return wait_ret;
-	} else if (unlikely(wait_ret == 0)) {
-		pr_err("timed out on ack waiting.\n");
-		return -ETIME;
-	}
-
-	kmem_cache_free(rdma_req_cache, req);
 	return ret;
 }
 
